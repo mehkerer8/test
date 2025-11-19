@@ -117,11 +117,12 @@ def activate_motors(pattern):
 # ==========================
 
 def read_pdf(path):
-    doc = fitz.open(path)
     text = ""
-    for page in doc:
-        text += page.get_text()
+    with pdfplumber.open(path) as pdf:
+        for page in pdf.pages:
+            text += page.extract_text() or ""
     return text
+
 
 
 def write_braille(text, voice=False, speed=0.3):
