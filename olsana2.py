@@ -57,7 +57,7 @@ braille_bin = {
 # ==========================
 def speak(text):
     """Türkçe sesli okuma VLC ile"""
-    tts_path = "/home/pi/temp.mp3"
+    tts_path = "./temp.mp3"
     tts = gTTS(text=text, lang="tr")
     tts.save(tts_path)
     player = vlc.MediaPlayer(tts_path)
