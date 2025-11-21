@@ -5,8 +5,12 @@ import time
 import threading
 from gtts import gTTS
 import vlc
+
+# GPIOZERO IMPORTLARI
+from gpiozero import OutputDevice, Button
 from gpiozero.pins.pigpio import PiGPIOFactory
 factory = PiGPIOFactory()
+
 from PyPDF2 import PdfReader  # PyPDF2 ile PDF okuma
 
 # ==========================
@@ -68,8 +72,12 @@ def speak(text):
 def scan_books():
     """USB ve yerel kitapları tarar"""
     books = []
-    os.makedirs(LOCAL_BOOKS, exist_ok=True)
-    for path in [LOCAL_BOOKS, USB_PATH]:
+    paths = [USB_PATH]
+
+    if LOCAL_BOOKS.endswith(".pdf") and os.path.exists(LOCAL_BOOKS):
+        books.append({"name": os.path.basename(LOCAL_BOOKS), "path": LOCAL_BOOKS, "position": 0})
+
+    for path in paths:
         if not os.path.exists(path):
             continue
         for root, dirs, files in os.walk(path):
@@ -106,7 +114,7 @@ def activate_motors(pattern):
         m.off()
 
 # ==========================
-# 5. KİTAP İŞLEMLERİ (PyPDF2 ile PDF okuma)
+# 5. KİTAP İŞLEMLERİ
 # ==========================
 def read_pdf(path):
     """PyPDF2 ile PDF’den metin çıkarma"""
@@ -115,8 +123,7 @@ def read_pdf(path):
         with open(path, "rb") as f:
             reader = PdfReader(f)
             for page in reader.pages:
-                page_text = page.extract_text() or ""
-                text += page_text + "\n"
+                text += (page.extract_text() or "") + "\n"
     except Exception as e:
         print("PDF okuma hatası:", e)
     return text
