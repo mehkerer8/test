@@ -5,15 +5,18 @@ import time
 import threading
 from gtts import gTTS
 import vlc
+from gpiozero import Button, OutputDevice
 from gpiozero.pins.pigpio import PiGPIOFactory
+from PyPDF2 import PdfReader
+
+# PiGPIOFactory kullanımı
 factory = PiGPIOFactory()
-from PyPDF2 import PdfReader  # PyPDF2 ile PDF okuma
 
 # ==========================
 # 1. GPIO AYARLARI
 # ==========================
 motor_pins = [5, 6, 13, 19, 26, 21]
-motors = [OutputDevice(pin, pin_factory=factory) for pin in motor_pins]
+motors = [OutputDevice(pin, active_high=True, initial_value=False, pin_factory=factory) for pin in motor_pins]
 
 buttons = {
     "voice_only": Button(17, pull_up=True, pin_factory=factory),
@@ -96,6 +99,7 @@ def text_to_braille_binary(text):
     return result
 
 def activate_motors(pattern):
+    """Braille motor çıkışı (röle üzerinden)"""
     for i in range(6):
         if pattern[i] == "1":
             motors[i].on()
@@ -109,7 +113,6 @@ def activate_motors(pattern):
 # 5. KİTAP İŞLEMLERİ (PyPDF2 ile PDF okuma)
 # ==========================
 def read_pdf(path):
-    """PyPDF2 ile PDF’den metin çıkarma"""
     text = ""
     try:
         with open(path, "rb") as f:
@@ -207,4 +210,4 @@ if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        pass
+        print("Program sonlandırıldı")
