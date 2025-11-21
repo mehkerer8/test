@@ -5,13 +5,14 @@ import time
 import threading
 from gtts import gTTS
 import vlc
+import requests
 
 # GPIOZERO IMPORTLARI
 from gpiozero import OutputDevice, Button
 from gpiozero.pins.pigpio import PiGPIOFactory
 factory = PiGPIOFactory()
 
-from PyPDF2 import PdfReader  # PyPDF2 ile PDF okuma
+from PyPDF2 import PdfReader
 
 # ==========================
 # 1. GPIO AYARLARI
@@ -25,6 +26,7 @@ buttons = {
     "speed_up": Button(22, pull_up=True, pin_factory=factory),
     "speed_down": Button(23, pull_up=True, pin_factory=factory),
     "next_book": Button(24, pull_up=True, pin_factory=factory),
+    "previous_book": Button(5, pull_up=True, pin_factory=factory),  # Örnek önceki kitap butonu
     "select_book": Button(25, pull_up=True, pin_factory=factory),
     "save_position": Button(4, pull_up=True, pin_factory=factory),
     "learn_mode": Button(18, pull_up=True, pin_factory=factory)
@@ -36,6 +38,8 @@ buttons = {
 DATA_FILE = "./book_data.json"
 LOCAL_BOOKS = "./Apartman.pdf"
 USB_PATH = "./"
+GITHUB_BOOKS_PATH = "./GithubBooks"  # GitHub PDF'leri bu klasörde olacak
+GITHUB_REPO_URL = "https://github.com/KULLANICI_ADIN/DEPO_ADI"  # senin repo
 
 # ==========================
 # 3. BRAILLE TABLOSU
@@ -57,22 +61,37 @@ braille_bin = {
 # ==========================
 def speak(text):
     """Türkçe sesli okuma VLC ile"""
-    tts_path = "./temp.mp3"
-    tts = gTTS(text=text, lang="tr")
-    tts.save(tts_path)
-    player = vlc.MediaPlayer(tts_path)
-    player.play()
-    while player.get_state() != vlc.State.Ended:
-        time.sleep(0.1)
     try:
+        tts_path = "./temp.mp3"
+        tts = gTTS(text=text, lang="tr")
+        tts.save(tts_path)
+        player = vlc.MediaPlayer(tts_path)
+        player.play()
+        while player.get_state() != vlc.State.Ended:
+            time.sleep(0.1)
         os.remove(tts_path)
-    except:
-        pass
+    except Exception as e:
+        print("Sesli okuma hatası:", e)
+
+def clone_github_repo():
+    """GitHub PDF klasörünü indir"""
+    if not os.path.exists(GITHUB_BOOKS_PATH):
+        os.makedirs(GITHUB_BOOKS_PATH)
+        # Burada requests ile tek tek PDF indirilebilir veya git clone kullanılabilir
+        # Örnek: bir PDF dosyası indir
+        example_pdf_url = "https://github.com/KULLANICI_ADIN/DEPO_ADI/raw/main/Kitap1.pdf"
+        local_pdf_path = os.path.join(GITHUB_BOOKS_PATH, "Kitap1.pdf")
+        try:
+            r = requests.get(example_pdf_url)
+            with open(local_pdf_path, "wb") as f:
+                f.write(r.content)
+        except Exception as e:
+            print("GitHub PDF çekme hatası:", e)
 
 def scan_books():
-    """USB ve yerel kitapları tarar"""
+    """USB, yerel ve GitHub kitaplarını tarar"""
     books = []
-    paths = [USB_PATH]
+    paths = [USB_PATH, GITHUB_BOOKS_PATH]
 
     if LOCAL_BOOKS.endswith(".pdf") and os.path.exists(LOCAL_BOOKS):
         books.append({"name": os.path.basename(LOCAL_BOOKS), "path": LOCAL_BOOKS, "position": 0})
@@ -99,11 +118,14 @@ def save_data(data):
 def text_to_braille_binary(text):
     result = []
     for ch in text.lower():
-        if ch in braille_bin:
-            result.append(braille_bin[ch])
+        pattern = braille_bin.get(ch, "000000")  # bilinmeyen karakterler için boş pattern
+        result.append(pattern)
     return result
 
 def activate_motors(pattern):
+    """6 bitlik pattern motorlara uygular"""
+    if len(pattern) != 6:
+        pattern = pattern.ljust(6, "0")
     for i in range(6):
         if pattern[i] == "1":
             motors[i].on()
@@ -113,9 +135,6 @@ def activate_motors(pattern):
     for m in motors:
         m.off()
 
-# ==========================
-# 5. KİTAP İŞLEMLERİ
-# ==========================
 def read_pdf(path):
     """PyPDF2 ile PDF’den metin çıkarma"""
     text = ""
@@ -123,7 +142,8 @@ def read_pdf(path):
         with open(path, "rb") as f:
             reader = PdfReader(f)
             for page in reader.pages:
-                text += (page.extract_text() or "") + "\n"
+                page_text = page.extract_text() or ""
+                text += page_text + "\n"
     except Exception as e:
         print("PDF okuma hatası:", e)
     return text
@@ -142,9 +162,10 @@ def write_braille(text, voice=False, speed=0.3):
         time.sleep(speed)
 
 # ==========================
-# 6. ANA AKIŞ
+# 5. ANA AKIŞ
 # ==========================
 def main():
+    clone_github_repo()  # GitHub PDF klasörünü hazırla
     data = load_data()
     data["books"] = scan_books()
     save_data(data)
@@ -157,6 +178,11 @@ def main():
     while True:
         if buttons["next_book"].is_pressed:
             book_index = (book_index + 1) % len(data["books"])
+            speak(f"{data['books'][book_index]['name']} seçildi")
+            time.sleep(0.5)
+
+        if buttons.get("previous_book") and buttons["previous_book"].is_pressed:
+            book_index = (book_index - 1) % len(data["books"])
             speak(f"{data['books'][book_index]['name']} seçildi")
             time.sleep(0.5)
 
