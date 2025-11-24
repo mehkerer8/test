@@ -5,7 +5,6 @@ import time
 import threading
 from gtts import gTTS
 import vlc
-import requests
 
 # GPIOZERO IMPORTLARI
 from gpiozero import OutputDevice, Button
@@ -26,7 +25,7 @@ buttons = {
     "speed_up": Button(22, pull_up=True, pin_factory=factory),
     "speed_down": Button(23, pull_up=True, pin_factory=factory),
     "next_book": Button(24, pull_up=True, pin_factory=factory),
-    "previous_book": Button(5, pull_up=True, pin_factory=factory),  # Örnek önceki kitap butonu
+    "previous_book": Button(5, pull_up=True, pin_factory=factory),  # Örnek önceki kitap
     "select_book": Button(25, pull_up=True, pin_factory=factory),
     "save_position": Button(4, pull_up=True, pin_factory=factory),
     "learn_mode": Button(18, pull_up=True, pin_factory=factory)
@@ -38,8 +37,7 @@ buttons = {
 DATA_FILE = "./book_data.json"
 LOCAL_BOOKS = "./Apartman.pdf"
 USB_PATH = "./"
-GITHUB_BOOKS_PATH = "./GithubBooks"  # GitHub PDF'leri bu klasörde olacak
-GITHUB_REPO_URL = "https://github.com/KULLANICI_ADIN/DEPO_ADI"  # senin repo
+GITHUB_BOOKS_PATH = "./GithubBooks"  # GitHub PDF'leri buraya konacak
 
 # ==========================
 # 3. BRAILLE TABLOSU
@@ -73,21 +71,6 @@ def speak(text):
     except Exception as e:
         print("Sesli okuma hatası:", e)
 
-def clone_github_repo():
-    """GitHub PDF klasörünü indir"""
-    if not os.path.exists(GITHUB_BOOKS_PATH):
-        os.makedirs(GITHUB_BOOKS_PATH)
-        # Burada requests ile tek tek PDF indirilebilir veya git clone kullanılabilir
-        # Örnek: bir PDF dosyası indir
-        example_pdf_url = "https://github.com/KULLANICI_ADIN/DEPO_ADI/raw/main/Kitap1.pdf"
-        local_pdf_path = os.path.join(GITHUB_BOOKS_PATH, "Kitap1.pdf")
-        try:
-            r = requests.get(example_pdf_url)
-            with open(local_pdf_path, "wb") as f:
-                f.write(r.content)
-        except Exception as e:
-            print("GitHub PDF çekme hatası:", e)
-
 def scan_books():
     """USB, yerel ve GitHub kitaplarını tarar"""
     books = []
@@ -116,16 +99,20 @@ def save_data(data):
         json.dump(data, f, indent=4, ensure_ascii=False)
 
 def text_to_braille_binary(text):
+    """Bilinmeyen karakterler için boş pattern kullanır"""
     result = []
     for ch in text.lower():
-        pattern = braille_bin.get(ch, "000000")  # bilinmeyen karakterler için boş pattern
+        pattern = braille_bin.get(ch, "000000")
         result.append(pattern)
     return result
 
 def activate_motors(pattern):
-    """6 bitlik pattern motorlara uygular"""
-    if len(pattern) != 6:
+    """Motorlara 6 bit pattern uygular, kısaysa sıfır ile tamamlar"""
+    if len(pattern) < 6:
         pattern = pattern.ljust(6, "0")
+    elif len(pattern) > 6:
+        pattern = pattern[:6]  # ekstra karakteri kırpar
+
     for i in range(6):
         if pattern[i] == "1":
             motors[i].on()
@@ -136,7 +123,7 @@ def activate_motors(pattern):
         m.off()
 
 def read_pdf(path):
-    """PyPDF2 ile PDF’den metin çıkarma"""
+    """PDF’den metin çıkarır"""
     text = ""
     try:
         with open(path, "rb") as f:
@@ -165,7 +152,6 @@ def write_braille(text, voice=False, speed=0.3):
 # 5. ANA AKIŞ
 # ==========================
 def main():
-    clone_github_repo()  # GitHub PDF klasörünü hazırla
     data = load_data()
     data["books"] = scan_books()
     save_data(data)
