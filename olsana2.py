@@ -25,7 +25,7 @@ buttons = {
     "speed_up": Button(22, pull_up=True, pin_factory=factory),
     "speed_down": Button(23, pull_up=True, pin_factory=factory),
     "next_book": Button(24, pull_up=True, pin_factory=factory),
-    "previous_book": Button(5, pull_up=True, pin_factory=factory),  # Örnek önceki kitap
+   "previous_book": Button(20, pull_up=True, pin_factory=factory),  # Örnek önceki kitap
     "select_book": Button(25, pull_up=True, pin_factory=factory),
     "save_position": Button(4, pull_up=True, pin_factory=factory),
     "learn_mode": Button(18, pull_up=True, pin_factory=factory)
@@ -227,3 +227,4 @@ if __name__ == "__main__":
         main()
     except KeyboardInterrupt:
         pass
+
