@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import time
 import threading
+import os
 from gtts import gTTS
 import vlc
 from gpiozero import OutputDevice, Button
@@ -37,7 +38,8 @@ braille_bin = {
 }
 
 def speak(t):
-    p = "./tts.mp3"
+    # Dosya yolunu kullanıcının home dizinine alıyoruz
+    p = os.path.expanduser("~/tts.mp3")
     gTTS(text=t, lang="tr").save(p)
     player = vlc.MediaPlayer(p)
     player.play()
@@ -52,6 +54,9 @@ def text_to_braille(t):
     return out
 
 def activate(pattern):
+    # pattern uzunluğunu kontrol ediyoruz
+    if len(pattern) != 6:
+        return
     for i in range(6):
         if pattern[i] == "1": motors[i].on()
         else: motors[i].off()
@@ -77,3 +82,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
