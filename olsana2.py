@@ -1,10 +1,12 @@
-#!/usr/bin/env python3
 import time
 import threading
+import os
+import random
 from gtts import gTTS
 import vlc
 from gpiozero import OutputDevice, Button
 from gpiozero.pins.pigpio import PiGPIOFactory
+
 factory = PiGPIOFactory()
 
 text_input = """
@@ -37,12 +39,22 @@ braille_bin = {
 }
 
 def speak(t):
-    p = "./tts.mp3"
-    gTTS(text=t, lang="tr").save(p)
-    player = vlc.MediaPlayer(p)
-    player.play()
-    while player.get_state() != vlc.State.Ended:
-        time.sleep(0.1)
+    filename = f"./tts_{random.randint(1000,9999)}.mp3"
+    p = filename
+    
+    try:
+        gTTS(text=t, lang="tr").save(p)
+        player = vlc.MediaPlayer(p)
+        player.play()
+        
+        while player.get_state() != vlc.State.Ended:
+            time.sleep(0.1)
+            
+        # Oynatma bittikten sonra dosyayı temizle
+        if os.path.exists(p):
+            os.remove(p)
+    except Exception as e:
+        print(f"TTS hatası: {e}")
 
 def text_to_braille(t):
     out = []
@@ -52,11 +64,19 @@ def text_to_braille(t):
     return out
 
 def activate(pattern):
+    # Pattern uzunluğunu kontrol et
+    if len(pattern) < 6:
+        print(f"Uyarı: Geçersiz pattern uzunluğu: {pattern}")
+        return
+    
     for i in range(6):
-        if pattern[i] == "1": motors[i].on()
-        else: motors[i].off()
+        if pattern[i] == "1": 
+            motors[i].on()
+        else: 
+            motors[i].off()
     time.sleep(0.25)
-    for m in motors: m.off()
+    for m in motors: 
+        m.off()
 
 def main():
     speed = 0.35
@@ -65,13 +85,18 @@ def main():
     threading.Thread(target=speak, args=(text_input,), daemon=True).start()
 
     for p in bra:
+        if p == "\n":  # Yeni satır karakterini atla
+            continue
+            
         activate(p)
 
         if buttons["speed_up"].is_pressed:
             speed = max(0.1, speed - 0.05)
+            print(f"Hız arttı: {speed}")
 
         if buttons["speed_down"].is_pressed:
             speed += 0.05
+            print(f"Hız azaldı: {speed}")
 
         time.sleep(speed)
 
