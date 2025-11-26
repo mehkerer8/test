@@ -1,0 +1,658 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import os
+import time
+import glob
+import json
+import subprocess
+import threading
+from threading import Thread, Lock, Event
+import RPi.GPIO as GPIO
+
+# GPIO Pin Tanımlamaları
+class GPIOPins:
+    # Röle Pinleri (6 solenoid için)
+    RELAY_PINS = [2, 3, 4, 17, 27, 22]  # 6 adet GPIO pin
+    
+    # Buton Pinleri
+    BUTTON_NEXT_PDF = 5      # Sonraki PDF
+    BUTTON_CONFIRM = 6       # Onay butonu
+    BUTTON_MODE_SELECT = 13  # Mod seçme
+    BUTTON_SPEED_UP = 19     # Hız artırma
+    BUTTON_SPEED_DOWN = 26   # Hız azaltma
+    BUTTON_SAVE_PROGRESS = 21 # İlerlemeyi kaydet
+    
+    # Tüm butonların listesi
+    ALL_BUTTONS = [BUTTON_NEXT_PDF, BUTTON_CONFIRM, BUTTON_MODE_SELECT, 
+                   BUTTON_SPEED_UP, BUTTON_SPEED_DOWN, BUTTON_SAVE_PROGRESS]
+
+class BrailleMachine:
+    def __init__(self):
+        print("Braille Kitap Okuma Makinesi başlatılıyor...")
+        
+        # GPIO Ayarları
+        GPIO.setmode(GPIO.BCM)
+        GPIO.setwarnings(False)
+        
+        # Değişkenler
+        self.current_pdf_index = 0
+        self.pdf_files = []
+        self.selected_pdf = None
+        self.current_mode = 0
+        self.modes = ["sadece_yazma", "sadece_okuma", "hem_okuma_hem_yazma", "egitim_modu"]
+        self.mode_names = ["Sadece Yazma Modu", "Sadece Okuma Modu", "Hem Okuma Hem Yazma Modu", "Braille Eğitim Modu"]
+        self.speech_speed = 150
+        self.is_running = True
+        self.progress_data = {}
+        self.current_position = 0
+        self.current_text = ""
+        self.is_playing = False
+        self.stop_event = Event()
+        
+        # Kilitleme mekanizması
+        self.lock = Lock()
+        
+        # Pinleri ayarla
+        self.setup_pins()
+        
+        # Braille haritasını yükle
+        self.setup_comprehensive_braille_map()
+        
+        # İlerleme dosyasını yükle
+        self.load_progress()
+        
+        # USB kontrol thread'i başlat
+        self.usb_check_thread = Thread(target=self.check_usb_loop, daemon=True)
+        self.usb_check_thread.start()
+        
+        print("Sistem hazır! USB bekleniyor...")
+
+    def setup_pins(self):
+        """GPIO pinlerini ayarla"""
+        try:
+            # Röle çıkışları
+            for pin in GPIOPins.RELAY_PINS:
+                GPIO.setup(pin, GPIO.OUT)
+                GPIO.output(pin, GPIO.LOW)
+            
+            # Buton girişleri
+            for pin in GPIOPins.ALL_BUTTONS:
+                GPIO.setup(pin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+            
+            # Buton interrupt'ları
+            GPIO.add_event_detect(GPIOPins.BUTTON_NEXT_PDF, GPIO.FALLING, 
+                                 callback=self.button_next_pdf_callback, bouncetime=500)
+            GPIO.add_event_detect(GPIOPins.BUTTON_CONFIRM, GPIO.FALLING, 
+                                 callback=self.button_confirm_callback, bouncetime=500)
+            GPIO.add_event_detect(GPIOPins.BUTTON_MODE_SELECT, GPIO.FALLING, 
+                                 callback=self.button_mode_callback, bouncetime=500)
+            GPIO.add_event_detect(GPIOPins.BUTTON_SPEED_UP, GPIO.FALLING, 
+                                 callback=self.button_speed_up_callback, bouncetime=500)
+            GPIO.add_event_detect(GPIOPins.BUTTON_SPEED_DOWN, GPIO.FALLING, 
+                                 callback=self.button_speed_down_callback, bouncetime=500)
+            GPIO.add_event_detect(GPIOPins.BUTTON_SAVE_PROGRESS, GPIO.FALLING, 
+                                 callback=self.button_save_callback, bouncetime=500)
+        except Exception as e:
+            print(f"GPIO kurulum hatası: {e}")
+
+    def setup_comprehensive_braille_map(self):
+        """Kapsamlı Braille alfabesi haritası (Türkçe karakterler ve işaretler)"""
+        self.braille_map = {
+            # Küçük harfler
+            'a': [1,0,0,0,0,0], 'b': [1,1,0,0,0,0], 'c': [1,0,0,1,0,0],
+            'ç': [1,0,0,1,1,0], 'd': [1,0,0,1,1,1], 'e': [1,0,0,0,1,0],
+            'f': [1,1,0,1,0,0], 'g': [1,1,0,1,1,0], 'ğ': [1,1,0,1,1,1],
+            'h': [1,1,0,0,1,0], 'ı': [0,1,0,1,0,1], 'i': [0,1,0,1,0,0],
+            'j': [0,1,0,1,1,0], 'k': [1,0,1,0,0,0], 'l': [1,1,1,0,0,0],
+            'm': [1,0,1,1,0,0], 'n': [1,0,1,1,1,0], 'o': [1,0,1,0,1,0],
+            'ö': [0,1,1,1,0,1], 'p': [1,1,1,1,0,0], 'r': [1,1,1,1,1,0],
+            's': [0,1,1,1,0,0], 'ş': [1,1,1,0,1,1], 't': [0,1,1,1,1,1],
+            'u': [1,0,1,0,0,1], 'ü': [0,1,1,1,1,0], 'v': [0,1,1,1,0,1],
+            'y': [1,0,1,1,1,1], 'z': [1,0,1,0,1,1],
+            
+            # Büyük harfler (büyük harf işareti + küçük harf)
+            'A': [0,0,0,0,0,1, 1,0,0,0,0,0], 'B': [0,0,0,0,0,1, 1,1,0,0,0,0],
+            'C': [0,0,0,0,0,1, 1,0,0,1,0,0], 'Ç': [0,0,0,0,0,1, 1,0,0,1,1,0],
+            'D': [0,0,0,0,0,1, 1,0,0,1,1,1], 'E': [0,0,0,0,0,1, 1,0,0,0,1,0],
+            'F': [0,0,0,0,0,1, 1,1,0,1,0,0], 'G': [0,0,0,0,0,1, 1,1,0,1,1,0],
+            'Ğ': [0,0,0,0,0,1, 1,1,0,1,1,1], 'H': [0,0,0,0,0,1, 1,1,0,0,1,0],
+            'I': [0,0,0,0,0,1, 0,1,0,1,0,1], 'İ': [0,0,0,0,0,1, 0,1,0,1,0,0],
+            'J': [0,0,0,0,0,1, 0,1,0,1,1,0], 'K': [0,0,0,0,0,1, 1,0,1,0,0,0],
+            'L': [0,0,0,0,0,1, 1,1,1,0,0,0], 'M': [0,0,0,0,0,1, 1,0,1,1,0,0],
+            'N': [0,0,0,0,0,1, 1,0,1,1,1,0], 'O': [0,0,0,0,0,1, 1,0,1,0,1,0],
+            'Ö': [0,0,0,0,0,1, 0,1,1,1,0,1], 'P': [0,0,0,0,0,1, 1,1,1,1,0,0],
+            'R': [0,0,0,0,0,1, 1,1,1,1,1,0], 'S': [0,0,0,0,0,1, 0,1,1,1,0,0],
+            'Ş': [0,0,0,0,0,1, 1,1,1,0,1,1], 'T': [0,0,0,0,0,1, 0,1,1,1,1,1],
+            'U': [0,0,0,0,0,1, 1,0,1,0,0,1], 'Ü': [0,0,0,0,0,1, 0,1,1,1,1,0],
+            'V': [0,0,0,0,0,1, 0,1,1,1,0,1], 'Y': [0,0,0,0,0,1, 1,0,1,1,1,1],
+            'Z': [0,0,0,0,0,1, 1,0,1,0,1,1],
+            
+            # Rakamlar (rakam işareti + harf)
+            '0': [0,1,0,1,1,1], '1': [1,0,0,0,0,0], '2': [1,1,0,0,0,0],
+            '3': [1,0,0,1,0,0], '4': [1,0,0,1,1,1], '5': [1,0,0,0,1,0],
+            '6': [1,1,0,1,0,0], '7': [1,1,0,1,1,0], '8': [1,1,0,0,1,0],
+            '9': [0,1,0,1,1,0],
+            
+            # Noktalama işaretleri
+            ' ': [0,0,0,0,0,0],    # Boşluk
+            '.': [0,1,0,0,1,1],    # Nokta
+            ',': [0,1,0,0,0,0],    # Virgül
+            '!': [0,1,1,0,1,0],    # Ünlem
+            '?': [0,1,1,0,0,1],    # Soru işareti
+            ':': [0,1,0,0,1,0],    # İki nokta
+            ';': [0,1,1,0,0,0],    # Noktalı virgül
+            '-': [0,0,1,0,0,1],    # Tire
+            '"': [0,1,1,0,0,1,0,1,1,0,0,1],  # Tırnak işareti
+            "'": [0,0,1,0,0,0],    # Kesme işareti
+            '(': [0,1,1,0,1,1],    # Parantez aç
+            ')': [0,1,1,0,1,1],    # Parantez kapa
+            '[': [0,1,1,0,1,1],    # Köşeli parantez aç
+            ']': [0,1,1,0,1,1],    # Köşeli parantez kapa
+            '{': [0,1,1,0,1,1],    # Süslü parantez aç
+            '}': [0,1,1,0,1,1],    # Süslü parantez kapa
+            '/': [0,0,1,1,0,0],    # Slash
+            '\\': [0,0,1,0,0,1],   # Backslash
+            '@': [0,0,1,1,1,1],    # Et işareti
+            '#': [0,0,1,1,1,1],    # Kare işareti
+            '$': [0,1,1,0,0,1,1,1,0,0,1,0],  # Dolar işareti
+            '%': [0,0,1,0,1,1],    # Yüzde işareti
+            '&': [0,1,1,1,1,1],    # Ve işareti
+            '*': [0,0,1,0,0,1],    # Yıldız
+            '+': [0,1,1,0,1,0],    # Artı
+            '=': [0,1,1,0,1,1],    # Eşittir
+            '<': [0,1,1,1,0,0],    # Küçüktür
+            '>': [0,0,1,1,0,1],    # Büyüktür
+            '^': [0,0,1,1,1,0],    # Şapka işareti
+            '~': [0,0,1,1,1,0],    # Tilde
+            '`': [0,0,1,0,0,0],    # Aksan işareti
+            '|': [0,1,1,0,1,1],    # Pipe işareti
+            '°': [0,0,1,1,1,0,0,1,0,1,1,0],  # Derece işareti
+            
+            # Türkçe özel karakterler
+            'â': [1,0,0,0,0,0],    # Şapkalı a (a olarak kabul edildi)
+            'î': [0,1,0,1,0,1],    # Şapkalı ı
+            'û': [1,0,1,0,0,1],    # Şapkalı u
+        }
+
+    def speak(self, text, wait=True):
+        """Metni seslendir (eSpeak kullanarak)"""
+        try:
+            # eSpeak komutu oluştur
+            cmd = [
+                'espeak', 
+                '-v', 'tr', 
+                '-s', str(self.speech_speed),
+                '-a', '200',
+                '"{}"'.format(text)
+            ]
+            
+            if wait:
+                subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            else:
+                # Asenkron konuşma
+                def speak_thread():
+                    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                Thread(target=speak_thread, daemon=True).start()
+                
+        except Exception as e:
+            print(f"Konuşma hatası: {e}")
+
+    def set_solenoids(self, pattern):
+        """Solenoidleri belirtilen pattern'e göre ayarla"""
+        try:
+            # Pattern uzunluğuna göre davran
+            if len(pattern) == 6:
+                # Normal 6 pinli pattern
+                for i, state in enumerate(pattern):
+                    if i < len(GPIOPins.RELAY_PINS):
+                        GPIO.output(GPIOPins.RELAY_PINS[i], GPIO.HIGH if state else GPIO.LOW)
+            elif len(pattern) == 12:
+                # 12 pinli pattern (büyük harf veya özel karakter)
+                # İlk 6 pin - özel işaret
+                for i, state in enumerate(pattern[:6]):
+                    if i < len(GPIOPins.RELAY_PINS):
+                        GPIO.output(GPIOPins.RELAY_PINS[i], GPIO.HIGH if state else GPIO.LOW)
+                time.sleep(1.5)
+                # Son 6 pin - asıl karakter
+                for i, state in enumerate(pattern[6:]):
+                    if i < len(GPIOPins.RELAY_PINS):
+                        GPIO.output(GPIOPins.RELAY_PINS[i], GPIO.HIGH if state else GPIO.LOW)
+        except Exception as e:
+            print(f"Solenoid kontrol hatası: {e}")
+
+    def clear_solenoids(self):
+        """Tüm solenoidleri kapat"""
+        try:
+            for pin in GPIOPins.RELAY_PINS:
+                GPIO.output(pin, GPIO.LOW)
+        except Exception as e:
+            print(f"Solenoid temizleme hatası: {e}")
+
+    def text_to_braille(self, text):
+        """Metni Braille pattern'lerine çevir"""
+        patterns = []
+        i = 0
+        while i < len(text):
+            char = text[i]
+            
+            # 2 karakterli özel durumları kontrol et
+            if i + 1 < len(text):
+                two_chars = text[i:i+2]
+                # Büyük harf kontrolü (ardışık büyük harfler)
+                if two_chars.isupper() and len(two_chars) == 2:
+                    # Büyük harf grubu işareti + iki harf
+                    patterns.append([0,0,0,0,0,1, 0,0,0,0,0,1])  # Çift büyük harf işareti
+                    patterns.append(self.braille_map.get(two_chars[0], [0,0,0,0,0,0]))
+                    patterns.append(self.braille_map.get(two_chars[1], [0,0,0,0,0,0]))
+                    i += 2
+                    continue
+            
+            # Tek karakter işleme
+            if char in self.braille_map:
+                patterns.append(self.braille_map[char])
+            else:
+                # Bilinmeyen karakter için boş pattern
+                patterns.append([0,0,0,0,0,0])
+            i += 1
+            
+        return patterns
+
+    def find_pdf_files(self):
+        """Tüm olası USB mount noktalarında PDF dosyalarını ara"""
+        possible_mount_points = [
+            "/media/pi/", "/media/", "/mnt/", "/run/media/pi/", 
+            "/media/usb/", "/mnt/usb/", "/home/pi/usb/"
+        ]
+        
+        pdf_files = []
+        
+        for mount_base in possible_mount_points:
+            if not os.path.exists(mount_base):
+                continue
+                
+            try:
+                # Tüm alt dizinleri ara
+                for root, dirs, files in os.walk(mount_base):
+                    for file in files:
+                        if file.lower().endswith('.pdf'):
+                            full_path = os.path.join(root, file)
+                            pdf_files.append(full_path)
+                            print(f"PDF bulundu: {full_path}")
+            except Exception as e:
+                print(f"Tarama hatası {mount_base}: {e}")
+                continue
+        
+        # Yinelenenleri kaldır ve sırala
+        pdf_files = list(set(pdf_files))
+        pdf_files.sort()
+        
+        return pdf_files
+
+    def read_pdf_text(self, pdf_path):
+        """PDF'den metin oku (pdftotext kullanarak)"""
+        try:
+            # pdftotext komutu ile PDF'den metin çıkar
+            temp_text_file = "/tmp/temp_pdf_text.txt"
+            cmd = ["pdftotext", "-layout", "-nopgbrk", pdf_path, temp_text_file]
+            
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            
+            if result.returncode == 0 and os.path.exists(temp_text_file):
+                with open(temp_text_file, 'r', encoding='utf-8', errors='ignore') as f:
+                    text = f.read()
+                # Geçici dosyayı temizle
+                os.remove(temp_text_file)
+                return text
+            else:
+                print(f"PDF okuma hatası: {result.stderr}")
+                return ""
+                
+        except Exception as e:
+            print(f"PDF işleme hatası: {e}")
+            return ""
+
+    def load_progress(self):
+        """Kaydedilmiş ilerlemeyi yükle"""
+        try:
+            if os.path.exists('progress.json'):
+                with open('progress.json', 'r', encoding='utf-8') as f:
+                    self.progress_data = json.load(f)
+                print("İlerleme verisi yüklendi")
+            else:
+                self.progress_data = {}
+        except Exception as e:
+            print(f"İlerleme yükleme hatası: {e}")
+            self.progress_data = {}
+
+    def save_progress(self):
+        """Mevcut ilerlemeyi kaydet"""
+        try:
+            if self.selected_pdf:
+                self.progress_data[self.selected_pdf] = {
+                    'position': self.current_position,
+                    'mode': self.current_mode,
+                    'timestamp': time.time()
+                }
+                with open('progress.json', 'w', encoding='utf-8') as f:
+                    json.dump(self.progress_data, f, ensure_ascii=False, indent=2)
+                print(f"İlerleme kaydedildi: {self.selected_pdf}")
+        except Exception as e:
+            print(f"İlerleme kaydetme hatası: {e}")
+
+    # Buton callback fonksiyonları
+    def button_next_pdf_callback(self, channel):
+        if GPIO.input(channel) == GPIO.LOW:  # Debounce kontrolü
+            with self.lock:
+                if not self.pdf_files:
+                    self.speak("Henüz PDF bulunamadı")
+                    return
+                self.current_pdf_index = (self.current_pdf_index + 1) % len(self.pdf_files)
+                pdf_name = os.path.basename(self.pdf_files[self.current_pdf_index])
+                self.speak(f"Sonraki kitap: {pdf_name}")
+
+    def button_confirm_callback(self, channel):
+        if GPIO.input(channel) == GPIO.LOW:
+            with self.lock:
+                if not self.pdf_files:
+                    self.speak("Önce USB takılı olduğundan emin olun")
+                    return
+                    
+                if self.selected_pdf is None:
+                    # PDF seçimi onayı
+                    self.selected_pdf = self.pdf_files[self.current_pdf_index]
+                    pdf_name = os.path.basename(self.selected_pdf)
+                    self.speak(f"{pdf_name} seçildi. Mod seçmek için mod tuşuna basın.")
+                    
+                    # Kayıtlı ilerlemeyi kontrol et
+                    if self.selected_pdf in self.progress_data:
+                        self.speak("Kayıtlı ilerleme bulundu. Kaldığınız yerden devam edebilirsiniz.")
+                else:
+                    # Mod onayı
+                    self.speak(f"{self.mode_names[self.current_mode]} seçildi. Başlıyor...")
+                    time.sleep(1)
+                    self.start_reading()
+
+    def button_mode_callback(self, channel):
+        if GPIO.input(channel) == GPIO.LOW:
+            with self.lock:
+                if self.selected_pdf is None:
+                    self.speak("Önce bir kitap seçin")
+                    return
+                    
+                self.current_mode = (self.current_mode + 1) % len(self.modes)
+                self.speak(self.mode_names[self.current_mode])
+
+    def button_speed_up_callback(self, channel):
+        if GPIO.input(channel) == GPIO.LOW:
+            with self.lock:
+                self.speech_speed = min(300, self.speech_speed + 20)
+                self.speak(f"Hız arttı")
+
+    def button_speed_down_callback(self, channel):
+        if GPIO.input(channel) == GPIO.LOW:
+            with self.lock:
+                self.speech_speed = max(80, self.speech_speed - 20)
+                self.speak(f"Hız azaltıldı")
+
+    def button_save_callback(self, channel):
+        if GPIO.input(channel) == GPIO.LOW:
+            with self.lock:
+                self.save_progress()
+                self.speak("İlerleme kaydedildi")
+
+    def check_usb_loop(self):
+        """USB kontrolü için ayrı thread"""
+        last_pdf_count = 0
+        
+        while self.is_running:
+            try:
+                current_pdfs = self.find_pdf_files()
+                current_count = len(current_pdfs)
+                
+                if current_count != last_pdf_count:
+                    if current_count > 0 and last_pdf_count == 0:
+                        # Yeni USB takıldı
+                        self.pdf_files = current_pdfs
+                        self.current_pdf_index = 0
+                        self.selected_pdf = None
+                        pdf_name = os.path.basename(self.pdf_files[0])
+                        self.speak(f"{current_count} adet PDF bulundu. İlk kitap: {pdf_name}")
+                        self.speak("Diğer kitaplar için ileri tuşuna, seçmek için onay tuşuna basın.")
+                    elif current_count == 0 and last_pdf_count > 0:
+                        # USB çıkarıldı
+                        self.pdf_files = []
+                        self.selected_pdf = None
+                        self.speak("USB çıkarıldı. Lütfen USB takın.")
+                    
+                    last_pdf_count = current_count
+                
+                time.sleep(2)  # 2 saniyede bir kontrol et
+                
+            except Exception as e:
+                print(f"USB kontrol hatası: {e}")
+                time.sleep(5)
+
+    def start_reading(self):
+        """Seçilen moda göre okuma/yazma işlemini başlat"""
+        if not self.selected_pdf:
+            return
+
+        # Mevcut işlemi durdur
+        self.stop_event.set()
+        self.is_playing = False
+        time.sleep(0.5)
+        self.stop_event.clear()
+
+        # PDF metnini oku
+        print(f"PDF okunuyor: {self.selected_pdf}")
+        self.speak("Kitap yükleniyor, lütfen bekleyin")
+        self.current_text = self.read_pdf_text(self.selected_pdf)
+        
+        if not self.current_text:
+            self.speak("PDF okunamadı veya boş. Lütfen başka bir kitap seçin.")
+            return
+
+        # Kayıtlı pozisyondan başla
+        if self.selected_pdf in self.progress_data:
+            self.current_position = self.progress_data[self.selected_pdf]['position']
+            self.speak(f"Kayıtlı pozisyondan devam ediliyor: {self.current_position}. karakter")
+        else:
+            self.current_position = 0
+
+        self.speak("Başlıyor")
+        time.sleep(1)
+
+        # Moda göre işlem yap
+        self.is_playing = True
+        if self.modes[self.current_mode] == "sadece_yazma":
+            self.mode_only_braille()
+        elif self.modes[self.current_mode] == "sadece_okuma":
+            self.mode_only_audio()
+        elif self.modes[self.current_mode] == "hem_okuma_hem_yazma":
+            self.mode_both()
+        elif self.modes[self.current_mode] == "egitim_modu":
+            self.mode_education()
+
+    def mode_only_braille(self):
+        """Sadece Braille yazma modu"""
+        braille_patterns = self.text_to_braille(self.current_text)
+        
+        for i in range(self.current_position, len(braille_patterns)):
+            if self.stop_event.is_set() or not self.is_playing:
+                break
+                
+            pattern = braille_patterns[i]
+            if sum(pattern) > 0:  # Boş pattern'leri atla
+                self.set_solenoids(pattern)
+                time.sleep(2)
+                self.clear_solenoids()
+                time.sleep(0.3)
+            
+            self.current_position = i
+            
+            # Her 100 karakterde bir ilerlemeyi otomatik kaydet
+            if i % 100 == 0:
+                self.save_progress()
+
+    def mode_only_audio(self):
+        """Sadece sesli okuma modu"""
+        # Metni parçalara böl (uzun metinler için)
+        chunk_size = 1000
+        text_to_speak = self.current_text[self.current_position:]
+        
+        for i in range(0, len(text_to_speak), chunk_size):
+            if self.stop_event.is_set() or not self.is_playing:
+                break
+                
+            chunk = text_to_speak[i:i+chunk_size]
+            self.speak(chunk)
+            self.current_position += len(chunk)
+            
+            # Her chunk'ta ilerlemeyi kaydet
+            self.save_progress()
+
+    def mode_both(self):
+        """Hem yazma hem okuma modu"""
+        braille_patterns = self.text_to_braille(self.current_text)
+        
+        for i in range(self.current_position, min(self.current_position + 500, len(braille_patterns))):
+            if self.stop_event.is_set() or not self.is_playing:
+                break
+                
+            char = self.current_text[i] if i < len(self.current_text) else ' '
+            pattern = braille_patterns[i]
+            
+            if sum(pattern) > 0:  # Boş pattern'leri atla
+                self.set_solenoids(pattern)
+                self.speak(char, wait=False)
+                time.sleep(2)
+                self.clear_solenoids()
+                time.sleep(0.3)
+            else:
+                # Boşluk için kısa bekleme
+                time.sleep(0.5)
+            
+            self.current_position = i
+            
+            # Her 50 karakterde bir ilerlemeyi otomatik kaydet
+            if i % 50 == 0:
+                self.save_progress()
+
+    def mode_education(self):
+        """Braille eğitim modu"""
+        education_sequence = [
+            ("a", "a harfi"), ("b", "b harfi"), ("c", "c harfi"), 
+            ("ç", "ç harfi"), ("d", "d harfi"), ("e", "e harfi"),
+            ("f", "f harfi"), ("g", "g harfi"), ("ğ", "ğ harfi"),
+            ("h", "h harfi"), ("ı", "ı harfi"), ("i", "i harfi"),
+            ("j", "j harfi"), ("k", "k harfi"), ("l", "l harfi"),
+            ("m", "m harfi"), ("n", "n harfi"), ("o", "o harfi"),
+            ("ö", "ö harfi"), ("p", "p harfi"), ("r", "r harfi"),
+            ("s", "s harfi"), ("ş", "ş harfi"), ("t", "t harfi"),
+            ("u", "u harfi"), ("ü", "ü harfi"), ("v", "v harfi"),
+            ("y", "y harfi"), ("z", "z harfi")
+        ]
+        
+        words = ["ali", "ev", "kalem", "kitap", "okul", "anne", "baba", "elma", "araba"]
+        
+        self.speak("Braille alfabesi eğitimine hoş geldiniz. Önce harfleri öğreneceğiz.")
+        time.sleep(2)
+        
+        # Harf eğitimi
+        for char, description in education_sequence:
+            if self.stop_event.is_set() or not self.is_playing:
+                break
+                
+            self.speak(description)
+            time.sleep(1)
+            
+            if char in self.braille_map:
+                self.set_solenoids(self.braille_map[char])
+                time.sleep(3)
+                self.clear_solenoids()
+                time.sleep(1)
+        
+        self.speak("Harfleri bitirdik. Şimdi kelimeleri öğreneceğiz.")
+        time.sleep(2)
+        
+        # Kelime eğitimi
+        for word in words:
+            if self.stop_event.is_set() or not self.is_playing:
+                break
+                
+            self.speak(f"Kelimemiz: {word}")
+            time.sleep(2)
+            
+            # Kelimeyi harf harf Braille olarak göster
+            for char in word:
+                if char in self.braille_map:
+                    self.set_solenoids(self.braille_map[char])
+                    time.sleep(2)
+                    self.clear_solenoids()
+                    time.sleep(0.5)
+            
+            time.sleep(3)  # Kullanıcının dokunması için zaman ver
+            self.speak(f"Kelimemiz: {word}")
+            time.sleep(2)
+
+    def main_loop(self):
+        """Ana program döngüsü"""
+        self.speak("Braille kitap okuma makinesine hoş geldiniz. Lütfen USB bellek takın.")
+        
+        try:
+            while self.is_running:
+                time.sleep(0.1)  # CPU kullanımını azalt
+                
+        except KeyboardInterrupt:
+            self.cleanup()
+
+    def cleanup(self):
+        """Program sonlandırma"""
+        print("Program sonlandırılıyor...")
+        self.is_running = False
+        self.stop_event.set()
+        self.is_playing = False
+        time.sleep(1)
+        self.clear_solenoids()
+        GPIO.cleanup()
+        print("Program sonlandırıldı.")
+
+def check_dependencies():
+    """Gerekli bağımlılıkları kontrol et ve kur"""
+    print("Bağımlılıklar kontrol ediliyor...")
+    
+    # Gerekli paketler
+    packages = [
+        "espeak", "espeak-data", "python3-rpi.gpio", "poppler-utils"
+    ]
+    
+    for package in packages:
+        try:
+            subprocess.run(["dpkg", "-l", package], check=True, 
+                         capture_output=True)
+            print(f"✓ {package} kurulu")
+        except subprocess.CalledProcessError:
+            print(f"✗ {package} kurulu değil, kuruluyor...")
+            subprocess.run(["sudo", "apt", "install", "-y", package], 
+                         check=True)
+            print(f"✓ {package} kuruldu")
+
+# Ana program
+if __name__ == "__main__":
+    print("=== Braille Kitap Okuma Makinesi ===")
+    
+    # Bağımlılıkları kontrol et
+    check_dependencies()
+    
+    # Programı başlat
+    machine = BrailleMachine()
+    
+    try:
+        machine.main_loop()
+    except KeyboardInterrupt:
+        print("\nKullanıcı tarafından durduruldu")
+    except Exception as e:
+        print(f"Beklenmeyen hata: {e}")
+    finally:
+        machine.cleanup()
