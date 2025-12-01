@@ -10,10 +10,10 @@ import threading
 from threading import Thread, Lock, Event
 import RPi.GPIO as GPIO
 
-# GPIO Pin Tanımlamaları
+# GPIO Pin Tanımlamaları - GÜNCELLENMİŞ
 class GPIOPins:
-    # Röle Pinleri (6 solenoid için)
-    RELAY_PINS = [2, 3, 4, 17, 27, 22]  # 6 adet GPIO pin
+    # Röle Pinleri (daha az çakışan pinler)
+    RELAY_PINS = [4, 17, 27, 22, 23, 24]  # 6 adet GPIO pin
     
     # Buton Pinleri
     BUTTON_NEXT_PDF = 5      # Sonraki PDF
@@ -21,7 +21,7 @@ class GPIOPins:
     BUTTON_MODE_SELECT = 13  # Mod seçme
     BUTTON_SPEED_UP = 19     # Hız artırma
     BUTTON_SPEED_DOWN = 26   # Hız azaltma
-    BUTTON_SAVE_PROGRESS = 21 # İlerlemeyi kaydet
+    BUTTON_SAVE_PROGRESS = 16 # GPIO 16
     
     # Tüm butonların listesi
     ALL_BUTTONS = [BUTTON_NEXT_PDF, BUTTON_CONFIRM, BUTTON_MODE_SELECT, 
@@ -33,7 +33,14 @@ class BrailleMachine:
         
         # GPIO Ayarları
         GPIO.setmode(GPIO.BCM)
-        GPIO.setwarnings(False)
+        GPIO.setwarnings(False)  # RuntimeWarning'leri gizle
+        
+        # Önce GPIO'yu temizle
+        try:
+            GPIO.cleanup()
+            time.sleep(0.5)
+        except:
+            pass
         
         # Değişkenler
         self.current_pdf_index = 0
@@ -53,8 +60,12 @@ class BrailleMachine:
         # Kilitleme mekanizması
         self.lock = Lock()
         
-        # Pinleri ayarla
-        self.setup_pins()
+        # Buton durum takibi
+        self.button_states = {}
+        self.last_button_time = {}
+        
+        # Pinleri ayarla (POLLING yöntemi)
+        self.setup_pins_polling()
         
         # Braille haritasını yükle
         self.setup_comprehensive_braille_map()
@@ -68,36 +79,27 @@ class BrailleMachine:
         
         print("Sistem hazır! USB bekleniyor...")
 
-    def setup_pins(self):
-        """GPIO pinlerini ayarla"""
+    def setup_pins_polling(self):
+        """GPIO pinlerini polling yöntemiyle ayarla"""
         try:
             # Röle çıkışları
             for pin in GPIOPins.RELAY_PINS:
                 GPIO.setup(pin, GPIO.OUT)
                 GPIO.output(pin, GPIO.LOW)
+                print(f"✓ Röle pin {pin} ayarlandı")
             
-            # Buton girişleri
+            # Buton girişleri (pull-up)
             for pin in GPIOPins.ALL_BUTTONS:
                 GPIO.setup(pin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+                self.button_states[pin] = GPIO.HIGH  # Başlangıç durumu
+                self.last_button_time[pin] = time.time()
+                print(f"✓ Buton pin {pin} ayarlandı")
             
-            # Buton interrupt'ları
-            GPIO.add_event_detect(GPIOPins.BUTTON_NEXT_PDF, GPIO.FALLING, 
-                                 callback=self.button_next_pdf_callback, bouncetime=500)
-            GPIO.add_event_detect(GPIOPins.BUTTON_CONFIRM, GPIO.FALLING, 
-                                 callback=self.button_confirm_callback, bouncetime=500)
-            GPIO.add_event_detect(GPIOPins.BUTTON_MODE_SELECT, GPIO.FALLING, 
-                                 callback=self.button_mode_callback, bouncetime=500)
-            GPIO.add_event_detect(GPIOPins.BUTTON_SPEED_UP, GPIO.FALLING, 
-                                 callback=self.button_speed_up_callback, bouncetime=500)
-            GPIO.add_event_detect(GPIOPins.BUTTON_SPEED_DOWN, GPIO.FALLING, 
-                                 callback=self.button_speed_down_callback, bouncetime=500)
-            GPIO.add_event_detect(GPIOPins.BUTTON_SAVE_PROGRESS, GPIO.FALLING, 
-                                 callback=self.button_save_callback, bouncetime=500)
         except Exception as e:
-            print(f"GPIO kurulum hatası: {e}")
+            print(f"✗ GPIO kurulum hatası: {e}")
 
     def setup_comprehensive_braille_map(self):
-        """Kapsamlı Braille alfabesi haritası (Türkçe karakterler ve işaretler)"""
+        """Kapsamlı Braille alfabesi haritası"""
         self.braille_map = {
             # Küçük harfler
             'a': [1,0,0,0,0,0], 'b': [1,1,0,0,0,0], 'c': [1,0,0,1,0,0],
@@ -128,7 +130,7 @@ class BrailleMachine:
             'V': [0,0,0,0,0,1, 0,1,1,1,0,1], 'Y': [0,0,0,0,0,1, 1,0,1,1,1,1],
             'Z': [0,0,0,0,0,1, 1,0,1,0,1,1],
             
-            # Rakamlar (rakam işareti + harf)
+            # Rakamlar
             '0': [0,1,0,1,1,1], '1': [1,0,0,0,0,0], '2': [1,1,0,0,0,0],
             '3': [1,0,0,1,0,0], '4': [1,0,0,1,1,1], '5': [1,0,0,0,1,0],
             '6': [1,1,0,1,0,0], '7': [1,1,0,1,1,0], '8': [1,1,0,0,1,0],
@@ -147,16 +149,10 @@ class BrailleMachine:
             "'": [0,0,1,0,0,0],    # Kesme işareti
             '(': [0,1,1,0,1,1],    # Parantez aç
             ')': [0,1,1,0,1,1],    # Parantez kapa
-            '[': [0,1,1,0,1,1],    # Köşeli parantez aç
-            ']': [0,1,1,0,1,1],    # Köşeli parantez kapa
-            '{': [0,1,1,0,1,1],    # Süslü parantez aç
-            '}': [0,1,1,0,1,1],    # Süslü parantez kapa
             '/': [0,0,1,1,0,0],    # Slash
             '\\': [0,0,1,0,0,1],   # Backslash
             '@': [0,0,1,1,1,1],    # Et işareti
             '#': [0,0,1,1,1,1],    # Kare işareti
-            '$': [0,1,1,0,0,1,1,1,0,0,1,0],  # Dolar işareti
-            '%': [0,0,1,0,1,1],    # Yüzde işareti
             '&': [0,1,1,1,1,1],    # Ve işareti
             '*': [0,0,1,0,0,1],    # Yıldız
             '+': [0,1,1,0,1,0],    # Artı
@@ -167,16 +163,15 @@ class BrailleMachine:
             '~': [0,0,1,1,1,0],    # Tilde
             '`': [0,0,1,0,0,0],    # Aksan işareti
             '|': [0,1,1,0,1,1],    # Pipe işareti
-            '°': [0,0,1,1,1,0,0,1,0,1,1,0],  # Derece işareti
             
             # Türkçe özel karakterler
-            'â': [1,0,0,0,0,0],    # Şapkalı a (a olarak kabul edildi)
+            'â': [1,0,0,0,0,0],    # Şapkalı a
             'î': [0,1,0,1,0,1],    # Şapkalı ı
             'û': [1,0,1,0,0,1],    # Şapkalı u
         }
 
     def speak(self, text, wait=True):
-        """Metni seslendir (eSpeak kullanarak)"""
+        """Metni seslendir (espeak kullanarak)"""
         try:
             # eSpeak komutu oluştur
             cmd = [
@@ -340,66 +335,89 @@ class BrailleMachine:
         except Exception as e:
             print(f"İlerleme kaydetme hatası: {e}")
 
-    # Buton callback fonksiyonları
-    def button_next_pdf_callback(self, channel):
-        if GPIO.input(channel) == GPIO.LOW:  # Debounce kontrolü
-            with self.lock:
-                if not self.pdf_files:
-                    self.speak("Henüz PDF bulunamadı")
-                    return
-                self.current_pdf_index = (self.current_pdf_index + 1) % len(self.pdf_files)
-                pdf_name = os.path.basename(self.pdf_files[self.current_pdf_index])
-                self.speak(f"Sonraki kitap: {pdf_name}")
+    def check_buttons_polling(self):
+        """Butonları polling ile kontrol et"""
+        current_time = time.time()
+        
+        for pin in GPIOPins.ALL_BUTTONS:
+            try:
+                current_state = GPIO.input(pin)
+                last_state = self.button_states.get(pin, GPIO.HIGH)
+                
+                # Buton basıldı mı? (HIGH -> LOW geçişi)
+                if current_state == GPIO.LOW and last_state == GPIO.HIGH:
+                    # Debounce kontrolü (300ms)
+                    if current_time - self.last_button_time.get(pin, 0) > 0.3:
+                        self.last_button_time[pin] = current_time
+                        self.handle_button_press(pin)
+                
+                # Durumu güncelle
+                self.button_states[pin] = current_state
+                
+            except Exception as e:
+                print(f"Buton {pin} okuma hatası: {e}")
 
-    def button_confirm_callback(self, channel):
-        if GPIO.input(channel) == GPIO.LOW:
-            with self.lock:
-                if not self.pdf_files:
-                    self.speak("Önce USB takılı olduğundan emin olun")
-                    return
-                    
-                if self.selected_pdf is None:
-                    # PDF seçimi onayı
-                    self.selected_pdf = self.pdf_files[self.current_pdf_index]
-                    pdf_name = os.path.basename(self.selected_pdf)
-                    self.speak(f"{pdf_name} seçildi. Mod seçmek için mod tuşuna basın.")
-                    
-                    # Kayıtlı ilerlemeyi kontrol et
-                    if self.selected_pdf in self.progress_data:
-                        self.speak("Kayıtlı ilerleme bulundu. Kaldığınız yerden devam edebilirsiniz.")
-                else:
-                    # Mod onayı
-                    self.speak(f"{self.mode_names[self.current_mode]} seçildi. Başlıyor...")
-                    time.sleep(1)
-                    self.start_reading()
+    def handle_button_press(self, pin):
+        """Basılan butona göre işlem yap"""
+        with self.lock:
+            if pin == GPIOPins.BUTTON_NEXT_PDF:
+                self.button_next_pdf_action()
+            elif pin == GPIOPins.BUTTON_CONFIRM:
+                self.button_confirm_action()
+            elif pin == GPIOPins.BUTTON_MODE_SELECT:
+                self.button_mode_action()
+            elif pin == GPIOPins.BUTTON_SPEED_UP:
+                self.button_speed_up_action()
+            elif pin == GPIOPins.BUTTON_SPEED_DOWN:
+                self.button_speed_down_action()
+            elif pin == GPIOPins.BUTTON_SAVE_PROGRESS:
+                self.button_save_action()
 
-    def button_mode_callback(self, channel):
-        if GPIO.input(channel) == GPIO.LOW:
-            with self.lock:
-                if self.selected_pdf is None:
-                    self.speak("Önce bir kitap seçin")
-                    return
-                    
-                self.current_mode = (self.current_mode + 1) % len(self.modes)
-                self.speak(self.mode_names[self.current_mode])
+    def button_next_pdf_action(self):
+        if not self.pdf_files:
+            self.speak("Henüz PDF bulunamadı")
+            return
+        self.current_pdf_index = (self.current_pdf_index + 1) % len(self.pdf_files)
+        pdf_name = os.path.basename(self.pdf_files[self.current_pdf_index])
+        self.speak(f"Sonraki kitap: {pdf_name}")
 
-    def button_speed_up_callback(self, channel):
-        if GPIO.input(channel) == GPIO.LOW:
-            with self.lock:
-                self.speech_speed = min(300, self.speech_speed + 20)
-                self.speak(f"Hız arttı")
+    def button_confirm_action(self):
+        if not self.pdf_files:
+            self.speak("Önce USB takılı olduğundan emin olun")
+            return
+            
+        if self.selected_pdf is None:
+            self.selected_pdf = self.pdf_files[self.current_pdf_index]
+            pdf_name = os.path.basename(self.selected_pdf)
+            self.speak(f"{pdf_name} seçildi. Mod seçmek için mod tuşuna basın.")
+            
+            # Kayıtlı ilerlemeyi kontrol et
+            if self.selected_pdf in self.progress_data:
+                self.speak("Kayıtlı ilerleme bulundu. Kaldığınız yerden devam edebilirsiniz.")
+        else:
+            self.speak(f"{self.mode_names[self.current_mode]} seçildi. Başlıyor...")
+            time.sleep(1)
+            self.start_reading()
 
-    def button_speed_down_callback(self, channel):
-        if GPIO.input(channel) == GPIO.LOW:
-            with self.lock:
-                self.speech_speed = max(80, self.speech_speed - 20)
-                self.speak(f"Hız azaltıldı")
+    def button_mode_action(self):
+        if self.selected_pdf is None:
+            self.speak("Önce bir kitap seçin")
+            return
+            
+        self.current_mode = (self.current_mode + 1) % len(self.modes)
+        self.speak(self.mode_names[self.current_mode])
 
-    def button_save_callback(self, channel):
-        if GPIO.input(channel) == GPIO.LOW:
-            with self.lock:
-                self.save_progress()
-                self.speak("İlerleme kaydedildi")
+    def button_speed_up_action(self):
+        self.speech_speed = min(300, self.speech_speed + 20)
+        self.speak(f"Hız arttı")
+
+    def button_speed_down_action(self):
+        self.speech_speed = max(80, self.speech_speed - 20)
+        self.speak(f"Hız azaltıldı")
+
+    def button_save_action(self):
+        self.save_progress()
+        self.speak("İlerleme kaydedildi")
 
     def check_usb_loop(self):
         """USB kontrolü için ayrı thread"""
@@ -602,9 +620,16 @@ class BrailleMachine:
         
         try:
             while self.is_running:
-                time.sleep(0.1)  # CPU kullanımını azalt
+                # Butonları kontrol et
+                self.check_buttons_polling()
+                
+                # Diğer işler...
+                time.sleep(0.05)  # 50ms bekle
                 
         except KeyboardInterrupt:
+            self.cleanup()
+        except Exception as e:
+            print(f"Ana döngü hatası: {e}")
             self.cleanup()
 
     def cleanup(self):
@@ -619,10 +644,9 @@ class BrailleMachine:
         print("Program sonlandırıldı.")
 
 def check_dependencies():
-    """Gerekli bağımlılıkları kontrol et ve kur"""
+    """Gerekli bağımlılıkları kontrol et"""
     print("Bağımlılıklar kontrol ediliyor...")
     
-    # Gerekli paketler
     packages = [
         "espeak", "espeak-data", "python3-rpi.gpio", "poppler-utils"
     ]
