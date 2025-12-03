@@ -5,106 +5,187 @@ import os
 import sys
 import time
 import json
-import hashlib
 import requests
-import threading
 import subprocess
+import threading
 from threading import Thread, Lock, Event
 import RPi.GPIO as GPIO
+from piper import PiperVoice
+import wave
+import numpy as np
 
 # ==================== KONFİGÜRASYON ====================
-GITHUB_REPO = "mehkerer8/pdfs"  # GitHub repo adınız
+GITHUB_REPO = "mehkerer8/pdfs"
 GITHUB_API_URL = f"https://api.github.com/repos/{GITHUB_REPO}/contents"
 LOCAL_BOOKS_DIR = "/home/pixel/braille_books"
-UPDATE_INTERVAL = 3600  # 1 saat
+UPDATE_INTERVAL = 3600
 
-# ==================== ESPEAK SES SİSTEMİ ====================
+# ==================== PİPER TTS SES SİSTEMİ ====================
 class VoiceEngine:
-    """eSpeak ile basit ve hızlı Türkçe ses"""
+    """Piper TTS ile Türkçe ses - YALNIZCA PİPER TTS KULLANIR"""
     
     def __init__(self):
+        self.voice = None
         self.setup()
     
     def setup(self):
-        """Ses motorunu kur"""
-        print("🔊 eSpeak ses motoru kuruluyor...")
+        """Piper TTS motorunu kur"""
+        print("🔊 Piper TTS ses motoru kuruluyor...")
         
-        # eSpeak kontrolü
+        # Piper TTS model dosyası
+        model_path = "/home/pixel/piper_models/tr_TR-arte-medium.onnx"
+        
         try:
-            result = subprocess.run(['espeak', '--version'], 
-                                   capture_output=True, 
-                                   text=True,
-                                   timeout=5)
-            if result.returncode == 0:
-                print("✅ eSpeak kurulu")
-            else:
-                self.install_espeak()
-        except (subprocess.TimeoutExpired, FileNotFoundError):
-            self.install_espeak()
+            # Model dosyasını kontrol et
+            if not os.path.exists(model_path):
+                print("⚠️ Piper modeli bulunamadı, indiriliyor...")
+                self.download_piper_model()
+            
+            # Piper TTS ses motorunu başlat
+            self.voice = PiperVoice.load(
+                model_path,
+                config_path=None,
+                use_cuda=False  # Raspberry Pi'de CPU kullan
+            )
+            print("✅ Piper TTS kuruldu ve hazır")
+            
+        except ImportError:
+            print("❌ Piper TTS kurulu değil, kuruluyor...")
+            self.install_piper_tts()
+            self.voice = PiperVoice.load(
+                model_path,
+                config_path=None,
+                use_cuda=False
+            )
         except Exception as e:
-            print(f"⚠️ eSpeak kontrol hatası: {e}")
-            self.install_espeak()
+            print(f"❌ Piper TTS hatası: {e}")
+            print("Piper TTS kurulumu için: pip install piper-tts")
+            raise
     
-    def install_espeak(self):
-        """eSpeak'ı kur"""
-        print("📦 eSpeak kuruluyor...")
+    def install_piper_tts(self):
+        """Piper TTS'i kur"""
+        print("📦 Piper TTS kuruluyor...")
         try:
-            subprocess.run(['sudo', 'apt', 'update'], 
-                          capture_output=True, 
-                          timeout=30)
-            subprocess.run(['sudo', 'apt', 'install', '-y', 'espeak'], 
-                          capture_output=True, 
-                          timeout=60)
-            print("✅ eSpeak kuruldu")
+            # Virtual environment kullanarak bağımlılık çakışmasını önle
+            subprocess.run(['pip3', 'install', '--upgrade', 'pip'], 
+                          capture_output=True, timeout=30)
+            
+            # Piper TTS'i belirli versiyonlarla kur
+            subprocess.run(['pip3', 'install', 'piper-tts==1.2.0'], 
+                          capture_output=True, timeout=60)
+            subprocess.run(['pip3', 'install', 'piper-phonemize==1.1.0'], 
+                          capture_output=True, timeout=60)
+            
+            print("✅ Piper TTS kuruldu")
         except Exception as e:
-            print(f"❌ eSpeak kurulum hatası: {e}")
-            raise Exception("eSpeak kurulamadı")
+            print(f"❌ Piper TTS kurulum hatası: {e}")
+            print("Alternatif kurulum: pip3 install piper-tts --no-deps")
+            raise
+    
+    def download_piper_model(self):
+        """Piper Türkçe modelini indir"""
+        model_url = "https://github.com/rhasspy/piper/releases/download/2023.12.06-09.23.38/tr_TR-arte-medium.onnx"
+        model_dir = "/home/pixel/piper_models"
+        
+        os.makedirs(model_dir, exist_ok=True)
+        model_path = os.path.join(model_dir, "tr_TR-arte-medium.onnx")
+        
+        print(f"📥 Piper modeli indiriliyor: {model_url}")
+        
+        try:
+            response = requests.get(model_url, stream=True, timeout=60)
+            if response.status_code == 200:
+                with open(model_path, 'wb') as f:
+                    for chunk in response.iter_content(chunk_size=8192):
+                        f.write(chunk)
+                print(f"✅ Model indirildi: {model_path}")
+                return True
+        except Exception as e:
+            print(f"❌ Model indirme hatası: {e}")
+        
+        return False
     
     def speak(self, text, wait=True, speed=1.0):
-        """Metni eSpeak ile seslendir"""
+        """Metni Piper TTS ile seslendir"""
+        if not self.voice:
+            print("⚠️ Piper TTS ses motoru hazır değil")
+            return
+        
         try:
-            # Hız ayarı: speed=1.0 → 160 wpm
-            wpm = int(160 * speed)
-            wpm = max(80, min(300, wpm))
+            # Türkçe metni hazırla
+            text = self.prepare_turkish_text(text)
             
-            # Türkçe karakter düzeltme
-            text = self.fix_turkish_text(text)
+            # Hız ayarı
+            # Piper'da hız değişkeni - 1.0 normal, artır/hızlandır
+            if speed > 1.0:
+                # Daha hızlı konuşma için sentence_silence kısalt
+                sentence_silence = max(0.0, 0.2 - (speed - 1.0) * 0.05)
+            else:
+                sentence_silence = 0.2
             
-            # Komut oluştur
-            cmd = ['espeak', '-v', 'tr+f3', '-s', str(wpm), '-a', '200', text]
+            # Ses sentezi için output stream oluştur
+            import io
+            audio_stream = io.BytesIO()
+            
+            # Piper ile ses sentezle
+            self.voice.synthesize(
+                text=text,
+                audio_stream=audio_stream,
+                sentence_silence_seconds=sentence_silence
+            )
+            
+            # Ses dosyasını oku ve çal
+            audio_stream.seek(0)
+            
+            # WAV dosyasını oku
+            with wave.open(audio_stream, 'rb') as wav_file:
+                # Audio parametreleri
+                framerate = wav_file.getframerate()
+                nframes = wav_file.getnframes()
+                audio_data = wav_file.readframes(nframes)
+                
+                # Audio'yu ALSA ile çal (Raspberry Pi için)
+                # audio_data'yı raw PCM olarak pipe'a yaz
+                import pyaudio
+                p = pyaudio.PyAudio()
+                
+                stream = p.open(
+                    format=p.get_format_from_width(wav_file.getsampwidth()),
+                    channels=wav_file.getnchannels(),
+                    rate=framerate,
+                    output=True
+                )
+                
+                stream.write(audio_data)
+                stream.stop_stream()
+                stream.close()
+                p.terminate()
             
             if wait:
-                subprocess.run(cmd, 
-                             stdout=subprocess.DEVNULL, 
-                             stderr=subprocess.DEVNULL, 
-                             timeout=len(text)/10)  # Timeout ekle
-            else:
-                Thread(target=lambda: subprocess.run(cmd, 
-                       stdout=subprocess.DEVNULL, 
-                       stderr=subprocess.DEVNULL), 
-                       daemon=True).start()
-                       
-        except subprocess.TimeoutExpired:
-            pass  # Zaman aşımı normal
+                time.sleep(len(text) / (15 * speed))  # Yaklaşık süre
+                
+        except ImportError as e:
+            print(f"❌ PyAudio hatası: {e}")
+            print("PyAudio kurmak için: sudo apt-get install python3-pyaudio")
+            # Basit bekleme ile devam et
+            if wait:
+                time.sleep(len(text) / (15 * speed))
         except Exception as e:
-            print(f"Ses hatası: {e}")
+            print(f"❌ Piper TTS ses hatası: {e}")
+            # Hata durumunda sessiz bekle
+            if wait:
+                time.sleep(len(text) / (15 * speed))
     
     def speak_async(self, text, speed=1.0):
         """Asenkron seslendirme"""
         Thread(target=self.speak, args=(text, True, speed), daemon=True).start()
     
-    def fix_turkish_text(self, text):
-        """Türkçe karakterleri eSpeak için düzelt"""
-        replacements = {
-            'ı': 'i', 'İ': 'I',
-            'ğ': 'g', 'Ğ': 'G',
-            'ü': 'u', 'Ü': 'U',
-            'ş': 's', 'Ş': 'S',
-            'ö': 'o', 'Ö': 'O',
-            'ç': 'c', 'Ç': 'C'
-        }
-        for old, new in replacements.items():
-            text = text.replace(old, new)
+    def prepare_turkish_text(self, text):
+        """Türkçe metni Piper TTS için hazırla"""
+        # Piper Türkçe modeli Türkçe karakterleri destekler
+        # Bu nedenle karakter değiştirmeye gerek yok
+        # Sadece gereksiz boşlukları temizle
+        text = ' '.join(text.split())
         return text
 
 # ==================== GPIO AYARLARI ====================
@@ -126,10 +207,12 @@ class GPIOPins:
 # ==================== BRAILLE KİTAP OKUYUCU ====================
 class BrailleBookReader:
     def __init__(self):
-        print("🎵 BRAİLLE KİTAP OKUYUCU - ESPEAK SÜRÜMÜ")
+        print("🎵 BRAİLLE KİTAP OKUYUCU - PİPER TTS SÜRÜMÜ")
         print("=" * 50)
+        print("⚠️ SADECE PİPER TTS KULLANILACAK - ESPEAK KULLANILMAYACAK")
         
-        # Ses motorunu kur
+        # PİPER TTS ses motorunu kur
+        print("🔊 PİPER TTS başlatılıyor...")
         self.voice_engine = VoiceEngine()
         
         # GPIO Ayarları
@@ -190,8 +273,8 @@ class BrailleBookReader:
         self.update_thread = Thread(target=self.auto_update_check, daemon=True)
         self.update_thread.start()
         
-        # Başlangıç mesajı
-        self.speak("Braille kitap okuyucuya hoş geldiniz.")
+        # Başlangıç mesajı - PİPER TTS İLE
+        self.speak("Braille kitap okuyucuya hoş geldiniz. Sistem PİPER TTS kullanıyor.")
         time.sleep(0.5)
         
         if self.books:
@@ -210,19 +293,19 @@ class BrailleBookReader:
         time.sleep(0.3)
         self.speak("Hız artırma ve azaltma tuşları ile okuma hızını ayarlayın.")
         
-        print("✅ Sistem başlatıldı!")
+        print("✅ PİPER TTS sistemi başlatıldı!")
     
-    # ==================== SES FONKSİYONLARI ====================
+    # ==================== PİPER TTS SES FONKSİYONLARI ====================
     def speak(self, text):
-        """Metni seslendir"""
+        """Metni PİPER TTS ile seslendir"""
         self.voice_engine.speak(text, wait=True, speed=self.speech_speed)
     
     def speak_async(self, text):
-        """Asenkron seslendirme"""
+        """Asenkron seslendirme - PİPER TTS"""
         self.voice_engine.speak_async(text, self.speech_speed)
     
     def adjust_speed(self, increase=True):
-        """Ses hızını ayarla"""
+        """Ses hızını ayarla - PİPER TTS"""
         with self.lock:
             if increase:
                 self.speech_speed = min(self.max_speed, self.speech_speed + 0.2)
@@ -232,7 +315,7 @@ class BrailleBookReader:
                 self.write_speed = min(0.5, self.write_speed + 0.05)
             
             speed_text = "hızlı" if self.speech_speed > 1.2 else "normal" if self.speech_speed > 0.8 else "yavaş"
-            self.speak(f"Ses hızı {speed_text}")
+            self.speak(f"Ses hızı {speed_text}. PİPER TTS kullanılıyor.")
     
     # ==================== GİTHUB PDF SİSTEMİ ====================
     def setup_directories(self):
@@ -309,7 +392,7 @@ class BrailleBookReader:
     def update_library(self, speak_progress=True):
         """Kitaplığı güncelle"""
         if speak_progress:
-            self.speak("Kitaplar güncelleniyor.")
+            self.speak("Kitaplar güncelleniyor. PİPER TTS kullanılıyor.")
         
         github_books = self.scan_github_for_pdfs()
         
@@ -340,7 +423,7 @@ class BrailleBookReader:
         
         if speak_progress:
             if success_count > 0:
-                self.speak(f"Güncelleme tamamlandı. {success_count} kitap eklendi.")
+                self.speak(f"Güncelleme tamamlandı. {success_count} kitap eklendi. PİPER TTS kullanılıyor.")
             else:
                 self.speak("Tüm kitaplar güncel.")
     
@@ -455,7 +538,7 @@ class BrailleBookReader:
         """Uzun basma işleyici - KİTABI BAŞTAN BAŞLAT"""
         if pin == GPIOPins.BUTTON_NEXT and self.is_playing and not self.is_paused:
             print(f"⏪ Uzun basma ({duration:.1f}s): Kitap baştan başlatılıyor...")
-            self.speak("Kitap baştan başlatılıyor")
+            self.speak("Kitap baştan başlatılıyor. PİPER TTS kullanılıyor.")
             
             self.stop_event.set()
             time.sleep(0.2)
@@ -497,13 +580,13 @@ class BrailleBookReader:
             # Kitap seçimi
             self.selected_book = self.books[self.current_book_index]
             book = self.selected_book
-            self.speak(f"{book['name_tr']} seçildi. Mod seçmek için mod tuşuna basın.")
+            self.speak(f"{book['name_tr']} seçildi. Mod seçmek için mod tuşuna basın. PİPER TTS kullanılıyor.")
         elif self.is_playing:
             # DURAKLAT/DEVAM ET
             self.toggle_pause()
         else:
             # Mod seçimi
-            self.speak(f"{self.mode_names[self.current_mode]} seçildi. Başlıyor...")
+            self.speak(f"{self.mode_names[self.current_mode]} seçildi. Başlıyor... PİPER TTS kullanılıyor.")
             time.sleep(0.5)
             self.start_reading()
     
@@ -515,10 +598,10 @@ class BrailleBookReader:
         self.is_paused = not self.is_paused
         
         if self.is_paused:
-            self.speak("Duraklatıldı")
+            self.speak("Duraklatıldı. PİPER TTS kullanılıyor.")
             self.clear_solenoids()
         else:
-            self.speak("Devam ediliyor")
+            self.speak("Devam ediliyor. PİPER TTS kullanılıyor.")
     
     def next_mode(self):
         """Sonraki mod"""
@@ -640,7 +723,7 @@ class BrailleBookReader:
         time.sleep(0.3)
         self.stop_event.clear()
         
-        self.speak("Kitap yükleniyor.")
+        self.speak("Kitap yükleniyor. PİPER TTS kullanılıyor.")
         self.current_text = self.read_pdf_content(self.selected_book)
         
         if not self.current_text or len(self.current_text) < 10:
@@ -667,7 +750,7 @@ class BrailleBookReader:
     
     def mode_write_only(self):
         """Sadece yazma modu"""
-        self.speak("Sadece yazma modu başlıyor.")
+        self.speak("Sadece yazma modu başlıyor. PİPER TTS kullanılıyor.")
         time.sleep(0.5)
         
         # 200 karakter yaz
@@ -695,7 +778,7 @@ class BrailleBookReader:
     
     def mode_read_only(self):
         """Sadece okuma modu"""
-        self.speak("Okuma modu başlıyor.")
+        self.speak("Okuma modu başlıyor. PİPER TTS kullanılıyor.")
         time.sleep(0.3)
         
         # 1000 karakter oku
@@ -712,7 +795,7 @@ class BrailleBookReader:
     
     def mode_read_and_write(self):
         """Hem okuma hem yazma modu - GÜNCELLENMİŞ SÜREKLİ"""
-        self.speak("Okuma ve yazma modu başlıyor.")
+        self.speak("Okuma ve yazma modu başlıyor. PİPER TTS kullanılıyor.")
         time.sleep(0.3)
         
         # SÜREKLİ OKUMA/YAZMA DÖNGÜSÜ
@@ -745,7 +828,7 @@ class BrailleBookReader:
                 
                 # Kelimeyi yaz
                 if self.write_word_fast(word):
-                    # Kelimeyi OKU (aynı anda veya hemen sonra)
+                    # Kelimeyi OKU (aynı anda veya hemen sonra) - PİPER TTS ile
                     self.speak_async(word)
                     
                     # Boşluk yaz (sessiz)
@@ -770,7 +853,7 @@ class BrailleBookReader:
     
     def mode_education(self):
         """Braille eğitim modu"""
-        self.speak("Braille eğitim modu başlıyor.")
+        self.speak("Braille eğitim modu başlıyor. PİPER TTS kullanılıyor.")
         time.sleep(0.5)
         
         letters = [
@@ -856,30 +939,32 @@ class BrailleBookReader:
         self.clear_solenoids()
         self.save_progress()
         GPIO.cleanup()
-        print("✅ Sistem kapatıldı")
+        print("✅ PİPER TTS sistemi kapatıldı")
 
 # ==================== ANA PROGRAM ====================
 def main():
     """Ana fonksiyon"""
     print("=" * 60)
-    print("🎵 BRAİLLE KİTAP OKUYUCU - ESPEAK SÜRÜMÜ")
+    print("🎵 BRAİLLE KİTAP OKUYUCU - PİPER TTS SÜRÜMÜ")
     print("=" * 60)
+    print("⚠️ UYARI: SADECE PİPER TTS KULLANILACAK!")
     print("🎯 ÖZELLİKLER:")
     print("  • 6 harf ≈ 2 saniye yazma")
     print("  • Sürekli okuma/yazma modu")
     print("  • Duraklatma özelliği (Onay tuşu)")
     print("  • Baştan başlatma (İleri tuşuna 2sn basılı tut)")
-    print("  • Sadece eSpeak kullanır")
+    print("  • SADECE PİPER TTS - ESPEAK YOK")
     print("=" * 60)
     
     # Bağımlılıkları kontrol et
     try:
         import requests
         import RPi.GPIO
-        print("✅ Python paketleri yüklü")
+        from piper import PiperVoice
+        print("✅ Temel Python paketleri yüklü")
     except ImportError as e:
         print(f"❌ Eksik paket: {e}")
-        print("Kurulum için: pip install requests RPi.GPIO")
+        print("Kurulum için: pip install requests RPi.GPIO piper-tts")
         return
     
     # Programı başlat
