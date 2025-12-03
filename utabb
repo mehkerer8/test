@@ -1,0 +1,817 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import os
+import sys
+import time
+import json
+import hashlib
+import requests
+import threading
+import subprocess
+from threading import Thread, Lock, Event
+import RPi.GPIO as GPIO
+
+# Piper TTS için
+from piper.voice import PiperVoice
+import sounddevice as sd
+import numpy as np
+import io
+
+# ==================== KONFİGÜRASYON ====================
+GITHUB_REPO = "mehkerer8/pdfs"
+GITHUB_API_URL = f"https://api.github.com/repos/{GITHUB_REPO}/contents"
+LOCAL_BOOKS_DIR = "/home/pixel/braille_books"
+UPDATE_INTERVAL = 3600
+
+# Piper TTS Model Yolu
+PIPER_MODEL_PATH = "/home/pixel/piper_models/tr_TR-ff-low.onnx"
+
+# ==================== PIPER TTS SES SİSTEMİ ====================
+class PiperVoiceEngine:
+    """Piper TTS ile Yüksek Kaliteli Türkçe Ses"""
+    
+    def __init__(self):
+        self.voice = None
+        self.lock = Lock()
+        self.setup()
+    
+    def setup(self):
+        """Piper TTS'yi başlat"""
+        print("🔊 Piper TTS kuruluyor...")
+        
+        try:
+            # Model dosyasını kontrol et
+            if not os.path.exists(PIPER_MODEL_PATH):
+                print("❌ Piper modeli bulunamadı! İndiriliyor...")
+                self.download_piper_model()
+            
+            # Piper ses motorunu yükle
+            with self.lock:
+                self.voice = PiperVoice.load(PIPER_MODEL_PATH)
+            
+            print("✅ Piper TTS başarıyla yüklendi")
+            
+        except Exception as e:
+            print(f"❌ Piper TTS yükleme hatası: {e}")
+            print("⚠️ eSpeak'a geri dönülüyor...")
+            self.voice = None
+    
+    def download_piper_model(self):
+        """Piper modelini indir"""
+        try:
+            os.makedirs(os.path.dirname(PIPER_MODEL_PATH), exist_ok=True)
+            
+            print("📥 Piper Türkçe modeli indiriliyor...")
+            
+            model_url = "https://huggingface.co/datasets/rhasspy/piper-voices/resolve/main/tr/tr_TR/ff/low/tr_TR-ff-low.onnx"
+            config_url = "https://huggingface.co/datasets/rhasspy/piper-voices/resolve/main/tr/tr_TR/ff/low/tr_TR-ff-low.onnx.json"
+            
+            # Modeli indir
+            response = requests.get(model_url, timeout=60)
+            with open(PIPER_MODEL_PATH, 'wb') as f:
+                f.write(response.content)
+            
+            # Config'i indir
+            config_path = PIPER_MODEL_PATH + ".json"
+            response = requests.get(config_url, timeout=60)
+            with open(config_path, 'wb') as f:
+                f.write(response.content)
+            
+            print("✅ Piper modeli indirildi")
+            
+        except Exception as e:
+            print(f"❌ Model indirme hatası: {e}")
+    
+    def speak(self, text, wait=True, speed=1.0):
+        """
+        Piper TTS ile yüksek kaliteli seslendirme
+        speed: 0.5 (yavaş) - 2.0 (hızlı)
+        """
+        if self.voice is None:
+            return self.speak_fallback(text, wait)
+        
+        try:
+            # Metni optimize et
+            text = self.fix_turkish_text(text)
+            
+            # Ses parametreleri
+            sentences = self.split_into_sentences(text)
+            
+            if wait:
+                for sentence in sentences:
+                    if sentence.strip():
+                        self._speak_sentence(sentence, speed)
+            else:
+                # Asenkron konuşma
+                Thread(target=self._speak_async, args=(text, speed), daemon=True).start()
+                
+        except Exception as e:
+            print(f"Piper TTS hatası: {e}")
+            self.speak_fallback(text, wait)
+    
+    def _speak_sentence(self, sentence, speed):
+        """Tek bir cümleyi seslendir"""
+        try:
+            # WAV verisi oluştur
+            with self.lock:
+                audio_data = self.voice.synthesize(
+                    sentence,
+                    length_scale=1.0/speed,  # Hız kontrolü
+                    noise_scale=0.667,
+                    noise_w=0.8
+                )
+            
+            # Ses çal
+            sd.play(audio_data.audio, audio_data.sample_rate)
+            sd.wait()
+            
+        except Exception as e:
+            print(f"Cümle seslendirme hatası: {e}")
+    
+    def _speak_async(self, text, speed):
+        """Asenkron seslendirme"""
+        self.speak(text, wait=True, speed=speed)
+    
+    def speak_fallback(self, text, wait=True):
+        """eSpeak fallback"""
+        try:
+            text = self.fix_turkish_text(text)
+            cmd = ['espeak', '-v', 'tr+f3', '-s', '160', text]
+            
+            if wait:
+                subprocess.run(cmd, stdout=subprocess.DEVNULL, 
+                             stderr=subprocess.DEVNULL)
+            else:
+                Thread(target=lambda: subprocess.run(cmd, 
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL), 
+                       daemon=True).start()
+        except Exception as e:
+            print(f"Fallback ses hatası: {e}")
+    
+    def split_into_sentences(self, text):
+        """Metni cümlelere ayır"""
+        sentences = []
+        current = ""
+        
+        for char in text:
+            current += char
+            if char in '.!?。！？':
+                sentences.append(current.strip())
+                current = ""
+        
+        if current.strip():
+            sentences.append(current.strip())
+        
+        return sentences if sentences else [text]
+    
+    def fix_turkish_text(self, text):
+        """Türkçe karakterleri düzelt (Piper için gerekli değil ama ekliyorum)"""
+        return text
+
+# ==================== GPIO AYARLARI ====================
+class GPIOPins:
+    # Röle Pinleri (6 solenoid için)
+    RELAY_PINS = [4, 17, 27, 22, 23, 24]
+    
+    # Buton Pinleri
+    BUTTON_NEXT = 5        # Sonraki kitap
+    BUTTON_CONFIRM = 6     # Onay/Seçim
+    BUTTON_MODE = 13       # Mod değiştirme
+    BUTTON_SPEED_UP = 19   # Hız artırma
+    BUTTON_SPEED_DOWN = 26 # Hız azaltma
+    BUTTON_UPDATE = 21     # Kitapları güncelle
+    
+    ALL_BUTTONS = [BUTTON_NEXT, BUTTON_CONFIRM, BUTTON_MODE, 
+                   BUTTON_SPEED_UP, BUTTON_SPEED_DOWN, BUTTON_UPDATE]
+
+# ==================== BRAILLE KİTAP OKUYUCU ====================
+class BrailleBookReader:
+    def __init__(self):
+        print("🎵 PIPER TTS BRAİLLE KİTAP OKUYUCU")
+        print("=" * 50)
+        
+        # Piper TTS ses motorunu kur
+        self.voice_engine = PiperVoiceEngine()
+        
+        # GPIO Ayarları
+        GPIO.setmode(GPIO.BCM)
+        GPIO.setwarnings(False)
+        
+        try:
+            GPIO.cleanup()
+            time.sleep(0.3)
+        except:
+            pass
+        
+        # Değişkenler
+        self.books = []
+        self.current_book_index = 0
+        self.selected_book = None
+        self.current_mode = 0
+        self.modes = ["sadece_yazma", "sadece_okuma", "hem_okuma_hem_yazma", "egitim_modu"]
+        self.mode_names = ["Sadece Yazma", "Sadece Okuma", "Hem Okuma Hem Yazma", "Braille Eğitimi"]
+        
+        # HIZ AYARLARI - PIPER için
+        self.speech_speed = 1.0  # Piper speed: 1.0 normal, 2.0 hızlı, 0.5 yavaş
+        self.write_speed = 0.3   # Yazma hızı (saniye/harf)
+        self.min_speed = 0.5     # Minimum konuşma hızı
+        self.max_speed = 2.0     # Maximum konuşma hızı
+        
+        # Sistem durumu
+        self.is_running = True
+        self.is_playing = False
+        self.stop_event = Event()
+        self.progress_data = {}
+        self.current_position = 0
+        self.current_text = ""
+        
+        # Buton takibi
+        self.button_states = {}
+        self.button_press_start = {}
+        self.last_button_time = {}
+        self.lock = Lock()
+        
+        # Dizinleri oluştur
+        self.setup_directories()
+        
+        # GPIO'yu ayarla
+        self.setup_gpio()
+        
+        # Braille haritasını yükle
+        self.setup_braille_map()
+        
+        # İlerlemeyi yükle
+        self.load_progress()
+        
+        # Kitapları yükle (yerelden)
+        self.load_local_books()
+        
+        # Otomatik güncelleme thread'i
+        self.update_thread = Thread(target=self.auto_update_check, daemon=True)
+        self.update_thread.start()
+        
+        # Başlangıç mesajı
+        self.speak("Piper TTS Braille kitap okuyucuya hoş geldiniz.")
+        time.sleep(0.5)
+        
+        if self.books:
+            self.speak(f"Kütüphanenizde {len(self.books)} kitap bulunuyor.")
+            time.sleep(0.5)
+            book_name = self.books[0]['name_tr']
+            self.speak(f"İlk kitap: {book_name}")
+        else:
+            self.speak("Henüz hiç kitap yok. Lütfen güncelle tuşuna basarak kitapları indirin.")
+        
+        self.speak("İleri tuşu ile kitaplar arasında gezin.")
+        time.sleep(0.3)
+        self.speak("Onay tuşu ile seçin.")
+        time.sleep(0.3)
+        self.speak("Mod tuşu ile okuma modunu değiştirin.")
+        
+        print("✅ Sistem başlatıldı!")
+    
+    # ==================== SES FONKSİYONLARI ====================
+    def speak(self, text):
+        """Piper TTS ile konuş"""
+        self.voice_engine.speak(text, wait=True, speed=self.speech_speed)
+    
+    def speak_async(self, text):
+        """Asenkron konuşma"""
+        Thread(target=lambda: self.voice_engine.speak(text, wait=True, speed=self.speech_speed), 
+               daemon=True).start()
+    
+    def adjust_speed(self, increase=True):
+        """Ses hızını ayarla"""
+        with self.lock:
+            if increase:
+                self.speech_speed = min(self.max_speed, self.speech_speed + 0.2)
+                self.write_speed = max(0.2, self.write_speed - 0.05)
+            else:
+                self.speech_speed = max(self.min_speed, self.speech_speed - 0.2)
+                self.write_speed = min(0.8, self.write_speed + 0.05)
+            
+            speed_text = "hızlı" if self.speech_speed > 1.2 else "normal" if self.speech_speed > 0.8 else "yavaş"
+            self.speak(f"Ses hızı {speed_text}")
+    
+    # ==================== GİTHUB PDF SİSTEMİ ====================
+    def setup_directories(self):
+        """Gerekli dizinleri oluştur"""
+        os.makedirs(LOCAL_BOOKS_DIR, exist_ok=True)
+        os.makedirs(f"{LOCAL_BOOKS_DIR}/pdfs", exist_ok=True)
+    
+    def load_local_books(self):
+        """Yerel kitapları yükle"""
+        auto_file = f"{LOCAL_BOOKS_DIR}/kitaplar_auto.json"
+        
+        if os.path.exists(auto_file):
+            try:
+                with open(auto_file, 'r', encoding='utf-8') as f:
+                    self.books = json.load(f)
+                print(f"📚 {len(self.books)} kitap yüklendi")
+            except Exception as e:
+                print(f"Kitaplar yüklenirken hata: {e}")
+                self.books = []
+        else:
+            self.books = []
+    
+    def scan_github_for_pdfs(self):
+        """GitHub'daki PDF'leri tara"""
+        print("🌐 GitHub'daki PDF'ler taranıyor...")
+        
+        try:
+            headers = {'User-Agent': 'Braille-Book-Reader'}
+            response = requests.get(GITHUB_API_URL, headers=headers, timeout=10)
+            
+            if response.status_code == 200:
+                files = response.json()
+                books = []
+                
+                for file in files:
+                    if isinstance(file, dict) and file.get('type') == 'file':
+                        filename = file.get('name', '')
+                        if filename.lower().endswith('.pdf'):
+                            book_name = self.create_book_name(filename)
+                            books.append({
+                                'filename': filename,
+                                'name_tr': book_name,
+                                'download_url': file.get('download_url', ''),
+                                'size': file.get('size', 0),
+                                'sha': file.get('sha', '')[:8]
+                            })
+                
+                print(f"✅ {len(books)} PDF bulundu")
+                return books
+            else:
+                print(f"❌ GitHub API hatası: {response.status_code}")
+                return []
+                
+        except Exception as e:
+            print(f"❌ Tarama hatası: {e}")
+            return []
+    
+    def create_book_name(self, filename):
+        """Dosya adından kitap adı oluştur"""
+        name = filename.replace('.pdf', '').replace('.PDF', '')
+        for char in ['_', '-', '.']:
+            name = name.replace(char, ' ')
+        
+        words = []
+        for word in name.split():
+            if word.lower() in ['ve', 'ile', 'de', 'da', 'ki']:
+                words.append(word.lower())
+            else:
+                words.append(word[0].upper() + word[1:].lower())
+        
+        result = ' '.join(words)
+        return result[:40] if len(result) > 40 else result
+    
+    def update_library(self, speak_progress=True):
+        """Kitaplığı güncelle"""
+        if speak_progress:
+            self.speak("Kitaplar güncelleniyor.")
+        
+        github_books = self.scan_github_for_pdfs()
+        
+        if not github_books:
+            if speak_progress:
+                self.speak("GitHub'dan kitap listesi alınamadı.")
+            return
+        
+        if speak_progress:
+            self.speak(f"{len(github_books)} kitap bulundu.")
+        
+        new_books = []
+        for book in github_books:
+            local_path = f"{LOCAL_BOOKS_DIR}/pdfs/{book['filename']}"
+            if not os.path.exists(local_path):
+                new_books.append(book)
+        
+        if speak_progress and new_books:
+            self.speak(f"{len(new_books)} yeni kitap indirilecek.")
+        
+        success_count = 0
+        for book in new_books:
+            if self.download_book(book):
+                success_count += 1
+        
+        self.save_book_metadata(github_books)
+        self.books = github_books
+        
+        if speak_progress:
+            if success_count > 0:
+                self.speak(f"Güncelleme tamamlandı. {success_count} kitap eklendi.")
+            else:
+                self.speak("Tüm kitaplar güncel.")
+    
+    def download_book(self, book):
+        """Kitabı indir"""
+        try:
+            response = requests.get(book['download_url'], timeout=30)
+            if response.status_code == 200:
+                file_path = f"{LOCAL_BOOKS_DIR}/pdfs/{book['filename']}"
+                with open(file_path, 'wb') as f:
+                    f.write(response.content)
+                return True
+        except:
+            pass
+        return False
+    
+    def save_book_metadata(self, books):
+        """Metadata'yı kaydet"""
+        metadata_path = f"{LOCAL_BOOKS_DIR}/kitaplar_auto.json"
+        try:
+            with open(metadata_path, 'w', encoding='utf-8') as f:
+                json.dump(books, f, ensure_ascii=False, indent=2)
+        except:
+            pass
+    
+    def auto_update_check(self):
+        """Otomatik güncelleme kontrolü"""
+        while self.is_running:
+            time.sleep(UPDATE_INTERVAL)
+            try:
+                requests.get("https://api.github.com", timeout=5)
+                self.update_library(speak_progress=False)
+            except:
+                pass
+    
+    # ==================== GPIO ve BUTON KONTROLÜ ====================
+    def setup_gpio(self):
+        """GPIO pinlerini ayarla"""
+        try:
+            for pin in GPIOPins.RELAY_PINS:
+                GPIO.setup(pin, GPIO.OUT)
+                GPIO.output(pin, GPIO.LOW)
+            
+            for pin in GPIOPins.ALL_BUTTONS:
+                GPIO.setup(pin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+                self.button_states[pin] = GPIO.HIGH
+                self.button_press_start[pin] = 0
+                self.last_button_time[pin] = time.time()
+            
+        except Exception as e:
+            print(f"GPIO hatası: {e}")
+    
+    def check_buttons(self):
+        """Butonları kontrol et"""
+        current_time = time.time()
+        
+        for pin in GPIOPins.ALL_BUTTONS:
+            try:
+                current_state = GPIO.input(pin)
+                last_state = self.button_states.get(pin, GPIO.HIGH)
+                
+                # Buton basıldı
+                if current_state == GPIO.LOW and last_state == GPIO.HIGH:
+                    self.button_press_start[pin] = current_time
+                    self.last_button_time[pin] = current_time
+                    self.handle_button_press(pin)
+                
+                # Buton basılı tutuluyor
+                elif current_state == GPIO.LOW and last_state == GPIO.LOW:
+                    press_duration = current_time - self.button_press_start[pin]
+                    
+                    # 2 saniye basılı tutunca BASTAN BASLAT
+                    if press_duration >= 2.0 and pin == GPIOPins.BUTTON_NEXT:
+                        if self.is_playing:
+                            self.handle_long_press(pin, press_duration)
+                            self.button_press_start[pin] = current_time
+                
+                # Buton bırakıldı
+                elif current_state == GPIO.HIGH and last_state == GPIO.LOW:
+                    self.button_press_start[pin] = 0
+                
+                self.button_states[pin] = current_state
+                
+            except:
+                pass
+    
+    def handle_button_press(self, pin):
+        """Kısa basma işleyici"""
+        with self.lock:
+            if pin == GPIOPins.BUTTON_NEXT:
+                self.next_book()
+            elif pin == GPIOPins.BUTTON_CONFIRM:
+                self.confirm_selection()
+            elif pin == GPIOPins.BUTTON_MODE:
+                self.next_mode()
+            elif pin == GPIOPins.BUTTON_SPEED_UP:
+                self.adjust_speed(increase=True)
+            elif pin == GPIOPins.BUTTON_SPEED_DOWN:
+                self.adjust_speed(increase=False)
+            elif pin == GPIOPins.BUTTON_UPDATE:
+                self.manual_update()
+    
+    def handle_long_press(self, pin, duration):
+        """Uzun basma işleyici"""
+        if pin == GPIOPins.BUTTON_NEXT and self.is_playing:
+            print(f"⏪ Uzun basma: Kitap baştan başlatılıyor...")
+            self.speak("Kitap baştan başlatılıyor")
+            
+            self.stop_event.set()
+            time.sleep(0.2)
+            self.stop_event.clear()
+            
+            self.current_position = 0
+            
+            if self.selected_book:
+                book_key = self.selected_book['filename']
+                self.progress_data[book_key] = {
+                    'position': 0,
+                    'mode': self.current_mode,
+                    'timestamp': time.time()
+                }
+                self.save_progress()
+            
+            self.start_reading()
+    
+    def next_book(self):
+        """Sonraki kitap"""
+        if not self.books:
+            self.speak("Henüz kitap yok. Güncelle tuşuna basın.")
+            return
+        
+        self.current_book_index = (self.current_book_index + 1) % len(self.books)
+        book = self.books[self.current_book_index]
+        self.speak(book['name_tr'])
+    
+    def confirm_selection(self):
+        """Seçimi onayla"""
+        if not self.books:
+            self.speak("Önce kitapları güncelleyin.")
+            return
+        
+        if self.selected_book is None:
+            self.selected_book = self.books[self.current_book_index]
+            book = self.selected_book
+            self.speak(f"{book['name_tr']} seçildi. Mod seçmek için mod tuşuna basın.")
+        else:
+            self.speak(f"{self.mode_names[self.current_mode]} seçildi. Başlıyor...")
+            time.sleep(0.5)
+            self.start_reading()
+    
+    def next_mode(self):
+        """Sonraki mod"""
+        if self.selected_book is None:
+            self.speak("Önce bir kitap seçin.")
+            return
+        
+        self.current_mode = (self.current_mode + 1) % len(self.modes)
+        self.speak(self.mode_names[self.current_mode])
+    
+    def manual_update(self):
+        """Manuel güncelleme"""
+        Thread(target=self.update_library, args=(True,), daemon=True).start()
+    
+    # ==================== BRAILLE SİSTEMİ ====================
+    def setup_braille_map(self):
+        """Braille haritasını yükle"""
+        self.braille_map = {
+            'a': [1,0,0,0,0,0], 'b': [1,1,0,0,0,0], 'c': [1,0,0,1,0,0],
+            'ç': [1,0,0,1,1,0], 'd': [1,0,0,1,1,1], 'e': [1,0,0,0,1,0],
+            'f': [1,1,0,1,0,0], 'g': [1,1,0,1,1,0], 'ğ': [1,1,0,1,1,1],
+            'h': [1,1,0,0,1,0], 'ı': [0,1,0,1,0,1], 'i': [0,1,0,1,0,0],
+            'j': [0,1,0,1,1,0], 'k': [1,0,1,0,0,0], 'l': [1,1,1,0,0,0],
+            'm': [1,0,1,1,0,0], 'n': [1,0,1,1,1,0], 'o': [1,0,1,0,1,0],
+            'ö': [0,1,1,1,0,1], 'p': [1,1,1,1,0,0], 'r': [1,1,1,1,1,0],
+            's': [0,1,1,1,0,0], 'ş': [1,1,1,0,1,1], 't': [0,1,1,1,1,1],
+            'u': [1,0,1,0,0,1], 'ü': [0,1,1,1,1,0], 'v': [0,1,1,1,0,1],
+            'y': [1,0,1,1,1,1], 'z': [1,0,1,0,1,1],
+            ' ': [0,0,0,0,0,0], '.': [0,1,0,0,1,1], ',': [0,1,0,0,0,0],
+            '!': [0,1,1,0,1,0], '?': [0,1,1,0,0,1]
+        }
+    
+    def set_solenoids(self, pattern):
+        """Solenoidleri ayarla"""
+        for i, state in enumerate(pattern[:6]):
+            if i < len(GPIOPins.RELAY_PINS):
+                GPIO.output(GPIOPins.RELAY_PINS[i], GPIO.HIGH if state else GPIO.LOW)
+    
+    def clear_solenoids(self):
+        """Solenoidleri temizle"""
+        for pin in GPIOPins.RELAY_PINS:
+            GPIO.output(pin, GPIO.LOW)
+    
+    def write_character_fast(self, char):
+        """Bir karakteri hızlı yaz"""
+        char_lower = char.lower()
+        if char_lower in self.braille_map:
+            pattern = self.braille_map[char_lower]
+            self.set_solenoids(pattern)
+            time.sleep(self.write_speed)
+            self.clear_solenoids()
+            time.sleep(0.05)
+            return True
+        return False
+    
+    # ==================== PDF OKUMA ====================
+    def read_pdf_content(self, book):
+        """PDF içeriğini oku"""
+        pdf_path = f"{LOCAL_BOOKS_DIR}/pdfs/{book['filename']}"
+        
+        if not os.path.exists(pdf_path):
+            return ""
+        
+        try:
+            temp_file = "/tmp/kitap_temp.txt"
+            cmd = ["pdftotext", "-layout", pdf_path, temp_file]
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            
+            if result.returncode == 0 and os.path.exists(temp_file):
+                with open(temp_file, 'r', encoding='utf-8') as f:
+                    text = f.read()
+                os.remove(temp_file)
+                return text[:2000] if len(text) > 2000 else text
+            return ""
+        except:
+            return ""
+    
+    def start_reading(self):
+        """Okumaya başla"""
+        if not self.selected_book:
+            return
+        
+        self.stop_event.set()
+        self.is_playing = False
+        time.sleep(0.3)
+        self.stop_event.clear()
+        
+        self.speak("Kitap yükleniyor.")
+        self.current_text = self.read_pdf_content(self.selected_book)
+        
+        if not self.current_text:
+            self.speak("Kitap okunamadı.")
+            return
+        
+        book_key = self.selected_book['filename']
+        if book_key in self.progress_data:
+            self.current_position = self.progress_data[book_key]['position']
+            self.speak("Kayıtlı yerden devam ediliyor.")
+        else:
+            self.current_position = 0
+        
+        self.is_playing = True
+        
+        if self.modes[self.current_mode] == "sadece_yazma":
+            self.mode_write_only()
+        elif self.modes[self.current_mode] == "sadece_okuma":
+            self.mode_read_only()
+        elif self.modes[self.current_mode] == "hem_okuma_hem_yazma":
+            self.mode_read_and_write()
+        elif self.modes[self.current_mode] == "egitim_modu":
+            self.mode_education()
+    
+    def mode_write_only(self):
+        """Sadece yazma modu"""
+        self.speak("Sadece yazma modu başlıyor.")
+        time.sleep(0.5)
+        
+        text_to_write = self.current_text[self.current_position:self.current_position + 100]
+        
+        char_count = 0
+        for char in text_to_write:
+            if self.stop_event.is_set() or not self.is_playing:
+                break
+            
+            if self.write_character_fast(char):
+                char_count += 1
+                self.current_position += 1
+            
+            if char_count % 20 == 0:
+                self.save_progress()
+        
+        self.is_playing = False
+        self.save_progress()
+        self.speak("Yazma modu tamamlandı.")
+    
+    def mode_read_only(self):
+        """Sadece okuma modu"""
+        self.speak("Okuma modu başlıyor.")
+        time.sleep(0.3)
+        
+        text_to_read = self.current_text[self.current_position:self.current_position + 500]
+        
+        if text_to_read.strip():
+            self.speak(text_to_read)
+        
+        self.current_position += len(text_to_read)
+        self.save_progress()
+        
+        self.is_playing = False
+        self.speak("Bölüm okundu. Tekrar okumak için onay tuşuna basın.")
+    
+    def mode_read_and_write(self):
+        """Hem okuma hem yazma modu - SÜREKLİ"""
+        self.speak("Okuma ve yazma modu başlıyor.")
+        time.sleep(0.3)
+        
+        text_to_process = self.current_text[self.current_position:self.current_position + 500]
+        words = text_to_process.split()
+        
+        if not words:
+            self.speak("Okunacak metin kalmadı.")
+            self.is_playing = False
+            return
+        
+        word_index = 0
+        
+        # SÜREKLİ OKUMA/YAZMA DÖNGÜSÜ
+        while word_index < len(words) and not self.stop_event.is_set() and self.is_playing:
+            word = words[word_index]
+            
+            # Kelimeyi yaz
+            write_success = True
+            for char in word:
+                if not self.write_character_fast(char):
+                    write_success = False
+                    break
+            
+            if write_success:
+                # Kelimeyi oku (asenkron - yazma devam ederken)
+                self.speak_async(word)
+                time.sleep(0.1)
+            
+            word_index += 1
+            self.current_position += len(word) + 1
+            
+            if word_index % 5 == 0:
+                self.save_progress()
+            
+            time.sleep(0.05)
+        
+        # MOD BİTİŞİ
+        self.is_playing = False
+        self.save_progress()
+        self.speak("Bölüm tamamlandı. Devam etmek için onay tuşuna basın.")
+    
+    def mode_education(self):
+        """Braille eğitim modu"""
+        self.speak("Braille eğitim modu başlıyor.")
+        time.sleep(0.5)
+        
+        letters = [("a", "a"), ("b", "be"), ("c", "ce"), ("ç", "çe"), ("d", "de")]
+        
+        for char, sound in letters:
+            if self.stop_event.is_set() or not self.is_playing:
+                break
+            
+            self.speak(sound)
+            time.sleep(0.3)
+            
+            if char in self.braille_map:
+                self.set_solenoids(self.braille_map[char])
+                time.sleep(1.0)
+                self.clear_solenoids()
+                time.sleep(0.3)
+        
+        self.is_playing = False
+        self.speak("Eğitim tamamlandı.")
+    
+    # ==================== İLERLEME YÖNETİMİ ====================
+    def load_progress(self):
+        """İlerlemeyi yükle"""
+        progress_file = f"{LOCAL_BOOKS_DIR}/progress.json"
+        if os.path.exists(progress_file):
+            try:
+                with open(progress_file, 'r', encoding='utf-8') as f:
+                    self.progress_data = json.load(f)
+            except:
+                self.progress_data = {}
+    
+    def save_progress(self):
+        """İlerlemeyi kaydet"""
+        if not self.selected_book:
+            return
+        
+        try:
+            book_key = self.selected_book['filename']
+            self.progress_data[book_key] = {
+                'position': self.current_position,
+                'mode': self.current_mode,
+                'timestamp': time.time()
+            }
+            
+            progress_file = f"{LOCAL_BOOKS_DIR}/progress.json"
+            with open(progress_file, 'w', encoding='utf-8') as f:
+                json.dump(self.progress_data, f, ensure_ascii=False, indent=2)
+        except:
+            pass
+    
+    # ==================== ANA DÖNGÜ ====================
+    def main_loop(self):
+        """Ana program döngüsü"""
+        try:
+            while self.is_running:
+                self.check_buttons()
+                time.sleep(0.02)
+                
+        except KeyboardInterrupt:
+            print("\n⏹️ Durduruldu")
+            self.cleanup()
+        except Exception as e:
+            print(f"Hata: {e}")
+            self.cleanup()
+    
+    def cleanup(self):
+        """Temiz
