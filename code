@@ -12,101 +12,100 @@ import subprocess
 from threading import Thread, Lock, Event
 import RPi.GPIO as GPIO
 
-# Piper TTS için
-try:
-    from piper.voice import PiperVoice
-    import sounddevice as sd
-    PIPER_AVAILABLE = True
-except ImportError:
-    PIPER_AVAILABLE = False
-    print("⚠️ Piper TTS kütüphaneleri kurulu değil, eSpeak kullanılacak")
-
 # ==================== KONFİGÜRASYON ====================
-GITHUB_REPO = "mehkerer8/pdfs"
+GITHUB_REPO = "mehkerer8/pdfs"  # GitHub repo adınız
 GITHUB_API_URL = f"https://api.github.com/repos/{GITHUB_REPO}/contents"
 LOCAL_BOOKS_DIR = "/home/pixel/braille_books"
-UPDATE_INTERVAL = 3600
+UPDATE_INTERVAL = 3600  # 1 saat
 
-# Piper TTS Model Yolu
-PIPER_MODEL_PATH = "/home/pixel/piper_models/tr_TR-ff-low.onnx"
-
-# ==================== SES SİSTEMİ ====================
+# ==================== ESPEAK SES SİSTEMİ ====================
 class VoiceEngine:
-    """Ses Motoru - Piper TTS veya eSpeak"""
+    """eSpeak ile basit ve hızlı Türkçe ses"""
     
     def __init__(self):
-        self.voice = None
-        self.lock = Lock()
         self.setup()
     
     def setup(self):
         """Ses motorunu kur"""
-        print("🔊 Ses motoru kuruluyor...")
+        print("🔊 eSpeak ses motoru kuruluyor...")
         
-        if PIPER_AVAILABLE:
-            try:
-                if os.path.exists(PIPER_MODEL_PATH):
-                    self.voice = PiperVoice.load(PIPER_MODEL_PATH)
-                    print("✅ Piper TTS başarıyla yüklendi")
-                else:
-                    print("⚠️ Piper modeli bulunamadı, eSpeak kullanılacak")
-            except Exception as e:
-                print(f"❌ Piper TTS yükleme hatası: {e}")
-        else:
-            print("⚠️ Piper TTS kurulu değil, eSpeak kullanılacak")
+        # eSpeak kontrolü
+        try:
+            result = subprocess.run(['espeak', '--version'], 
+                                   capture_output=True, 
+                                   text=True,
+                                   timeout=5)
+            if result.returncode == 0:
+                print("✅ eSpeak kurulu")
+            else:
+                self.install_espeak()
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            self.install_espeak()
+        except Exception as e:
+            print(f"⚠️ eSpeak kontrol hatası: {e}")
+            self.install_espeak()
+    
+    def install_espeak(self):
+        """eSpeak'ı kur"""
+        print("📦 eSpeak kuruluyor...")
+        try:
+            subprocess.run(['sudo', 'apt', 'update'], 
+                          capture_output=True, 
+                          timeout=30)
+            subprocess.run(['sudo', 'apt', 'install', '-y', 'espeak'], 
+                          capture_output=True, 
+                          timeout=60)
+            print("✅ eSpeak kuruldu")
+        except Exception as e:
+            print(f"❌ eSpeak kurulum hatası: {e}")
+            raise Exception("eSpeak kurulamadı")
     
     def speak(self, text, wait=True, speed=1.0):
-        """Metni seslendir"""
+        """Metni eSpeak ile seslendir"""
         try:
-            if self.voice is not None and PIPER_AVAILABLE:
-                self._speak_piper(text, speed)
-            else:
-                self._speak_espeak(text, speed)
-        except Exception as e:
-            print(f"Ses hatası: {e}")
-            self._speak_espeak(text, speed)
-    
-    def _speak_piper(self, text, speed):
-        """Piper TTS ile seslendirme"""
-        try:
-            # Hız ayarı için length_scale
-            length_scale = max(0.5, min(2.0, 1.0/speed))
-            
-            with self.lock:
-                audio_data = self.voice.synthesize(
-                    text,
-                    length_scale=length_scale,
-                    noise_scale=0.667,
-                    noise_w=0.8
-                )
-            
-            sd.play(audio_data.audio, audio_data.sample_rate)
-            sd.wait()
-        except Exception as e:
-            print(f"Piper ses hatası: {e}")
-            self._speak_espeak(text, speed)
-    
-    def _speak_espeak(self, text, speed):
-        """eSpeak ile seslendirme"""
-        try:
-            # Hız dönüşümü: speed=1.0 → 160 wpm
+            # Hız ayarı: speed=1.0 → 160 wpm
             wpm = int(160 * speed)
             wpm = max(80, min(300, wpm))
             
-            cmd = ['espeak', '-v', 'tr+f3', '-s', str(wpm), text]
+            # Türkçe karakter düzeltme
+            text = self.fix_turkish_text(text)
             
-            # Uzun metinler için timeout
-            timeout = max(5, len(text) / 50)
-            subprocess.run(cmd, stdout=subprocess.DEVNULL, 
-                         stderr=subprocess.DEVNULL, timeout=timeout)
+            # Komut oluştur
+            cmd = ['espeak', '-v', 'tr+f3', '-s', str(wpm), '-a', '200', text]
+            
+            if wait:
+                subprocess.run(cmd, 
+                             stdout=subprocess.DEVNULL, 
+                             stderr=subprocess.DEVNULL, 
+                             timeout=len(text)/10)  # Timeout ekle
+            else:
+                Thread(target=lambda: subprocess.run(cmd, 
+                       stdout=subprocess.DEVNULL, 
+                       stderr=subprocess.DEVNULL), 
+                       daemon=True).start()
+                       
         except subprocess.TimeoutExpired:
-            pass
+            pass  # Zaman aşımı normal
         except Exception as e:
-            print(f"eSpeak hatası: {e}")
+            print(f"Ses hatası: {e}")
     
     def speak_async(self, text, speed=1.0):
         """Asenkron seslendirme"""
         Thread(target=self.speak, args=(text, True, speed), daemon=True).start()
+    
+    def fix_turkish_text(self, text):
+        """Türkçe karakterleri eSpeak için düzelt"""
+        replacements = {
+            'ı': 'i', 'İ': 'I',
+            'ğ': 'g', 'Ğ': 'G',
+            'ü': 'u', 'Ü': 'U',
+            'ş': 's', 'Ş': 'S',
+            'ö': 'o', 'Ö': 'O',
+            'ç': 'c', 'Ç': 'C'
+        }
+        for old, new in replacements.items():
+            text = text.replace(old, new)
+        return text
 
 # ==================== GPIO AYARLARI ====================
 class GPIOPins:
@@ -127,7 +126,7 @@ class GPIOPins:
 # ==================== BRAILLE KİTAP OKUYUCU ====================
 class BrailleBookReader:
     def __init__(self):
-        print("🎵 BRAİLLE KİTAP OKUYUCU - GÜNCELLENMİŞ")
+        print("🎵 BRAİLLE KİTAP OKUYUCU - ESPEAK SÜRÜMÜ")
         print("=" * 50)
         
         # Ses motorunu kur
@@ -151,7 +150,7 @@ class BrailleBookReader:
         self.modes = ["sadece_yazma", "sadece_okuma", "hem_okuma_hem_yazma", "egitim_modu"]
         self.mode_names = ["Sadece Yazma", "Sadece Okuma", "Hem Okuma Hem Yazma", "Braille Eğitimi"]
         
-        # HIZ AYARLARI - GÜNCELLENMİŞ
+        # HIZ AYARLARI
         self.speech_speed = 1.0    # Ses hızı (1.0 normal)
         self.write_speed = 0.33    # Yazma hızı: 6 harf ≈ 2 saniye
         self.min_speed = 0.5
@@ -208,6 +207,8 @@ class BrailleBookReader:
         self.speak("Onay tuşu ile seçin veya duraklat.")
         time.sleep(0.3)
         self.speak("Mod tuşu ile okuma modunu değiştirin.")
+        time.sleep(0.3)
+        self.speak("Hız artırma ve azaltma tuşları ile okuma hızını ayarlayın.")
         
         print("✅ Sistem başlatıldı!")
     
@@ -225,7 +226,7 @@ class BrailleBookReader:
         with self.lock:
             if increase:
                 self.speech_speed = min(self.max_speed, self.speech_speed + 0.2)
-                self.write_speed = max(0.25, self.write_speed - 0.05)  # Daha hızlı yazma
+                self.write_speed = max(0.25, self.write_speed - 0.05)
             else:
                 self.speech_speed = max(self.min_speed, self.speech_speed - 0.2)
                 self.write_speed = min(0.5, self.write_speed + 0.05)
@@ -260,7 +261,7 @@ class BrailleBookReader:
         
         try:
             headers = {'User-Agent': 'Braille-Book-Reader'}
-            response = requests.get(GITHUB_API_URL, headers=headers, timeout=10)
+            response = requests.get(GITHUB_API_URL, headers=headers, timeout=15)
             
             if response.status_code == 200:
                 files = response.json()
@@ -346,14 +347,17 @@ class BrailleBookReader:
     def download_book(self, book):
         """Kitabı indir"""
         try:
-            response = requests.get(book['download_url'], timeout=30)
+            response = requests.get(book['download_url'], timeout=60)
             if response.status_code == 200:
                 file_path = f"{LOCAL_BOOKS_DIR}/pdfs/{book['filename']}"
                 with open(file_path, 'wb') as f:
                     f.write(response.content)
+                print(f"📥 {book['filename']} indirildi")
                 return True
-        except:
-            pass
+            else:
+                print(f"❌ {book['filename']} indirilemedi: {response.status_code}")
+        except Exception as e:
+            print(f"❌ {book['filename']} indirme hatası: {e}")
         return False
     
     def save_book_metadata(self, books):
@@ -362,8 +366,9 @@ class BrailleBookReader:
         try:
             with open(metadata_path, 'w', encoding='utf-8') as f:
                 json.dump(books, f, ensure_ascii=False, indent=2)
-        except:
-            pass
+            print("📁 Metadata kaydedildi")
+        except Exception as e:
+            print(f"❌ Metadata kaydetme hatası: {e}")
     
     def auto_update_check(self):
         """Otomatik güncelleme kontrolü"""
@@ -379,18 +384,22 @@ class BrailleBookReader:
     def setup_gpio(self):
         """GPIO pinlerini ayarla"""
         try:
+            # Röle pinleri
             for pin in GPIOPins.RELAY_PINS:
                 GPIO.setup(pin, GPIO.OUT)
                 GPIO.output(pin, GPIO.LOW)
             
+            # Buton pinleri
             for pin in GPIOPins.ALL_BUTTONS:
                 GPIO.setup(pin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
                 self.button_states[pin] = GPIO.HIGH
                 self.button_press_start[pin] = 0
                 self.last_button_time[pin] = time.time()
             
+            print("✅ GPIO ayarlandı")
+            
         except Exception as e:
-            print(f"GPIO hatası: {e}")
+            print(f"❌ GPIO hatası: {e}")
     
     def check_buttons(self):
         """Butonları kontrol et"""
@@ -423,8 +432,8 @@ class BrailleBookReader:
                 
                 self.button_states[pin] = current_state
                 
-            except:
-                pass
+            except Exception as e:
+                print(f"Buton kontrol hatası: {e}")
     
     def handle_button_press(self, pin):
         """Kısa basma işleyici"""
@@ -507,9 +516,9 @@ class BrailleBookReader:
         
         if self.is_paused:
             self.speak("Duraklatıldı")
+            self.clear_solenoids()
         else:
             self.speak("Devam ediliyor")
-            # Duraklatma durumu kaldırıldı, devam et
     
     def next_mode(self):
         """Sonraki mod"""
@@ -594,11 +603,14 @@ class BrailleBookReader:
         
         try:
             # pdftotext kontrolü
-            result = subprocess.run(['which', 'pdftotext'], capture_output=True, text=True)
+            result = subprocess.run(['which', 'pdftotext'], 
+                                   capture_output=True, 
+                                   text=True)
             if result.returncode != 0:
                 print("⚠️ pdftotext bulunamadı, kuruluyor...")
                 subprocess.run(['sudo', 'apt', 'install', '-y', 'poppler-utils'], 
-                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                              stdout=subprocess.DEVNULL, 
+                              stderr=subprocess.DEVNULL)
             
             temp_file = "/tmp/kitap_temp.txt"
             cmd = ["pdftotext", "-layout", "-enc", "UTF-8", pdf_path, temp_file]
@@ -796,6 +808,7 @@ class BrailleBookReader:
             try:
                 with open(progress_file, 'r', encoding='utf-8') as f:
                     self.progress_data = json.load(f)
+                print("📈 İlerleme yüklendi")
             except:
                 self.progress_data = {}
     
@@ -815,8 +828,8 @@ class BrailleBookReader:
             progress_file = f"{LOCAL_BOOKS_DIR}/progress.json"
             with open(progress_file, 'w', encoding='utf-8') as f:
                 json.dump(self.progress_data, f, ensure_ascii=False, indent=2)
-        except:
-            pass
+        except Exception as e:
+            print(f"❌ İlerleme kaydetme hatası: {e}")
     
     # ==================== ANA DÖNGÜ ====================
     def main_loop(self):
@@ -849,13 +862,14 @@ class BrailleBookReader:
 def main():
     """Ana fonksiyon"""
     print("=" * 60)
-    print("🎵 BRAİLLE KİTAP OKUYUCU - GÜNCELLENMİŞ SÜRÜM")
+    print("🎵 BRAİLLE KİTAP OKUYUCU - ESPEAK SÜRÜMÜ")
     print("=" * 60)
     print("🎯 ÖZELLİKLER:")
     print("  • 6 harf ≈ 2 saniye yazma")
     print("  • Sürekli okuma/yazma modu")
     print("  • Duraklatma özelliği (Onay tuşu)")
     print("  • Baştan başlatma (İleri tuşuna 2sn basılı tut)")
+    print("  • Sadece eSpeak kullanır")
     print("=" * 60)
     
     # Bağımlılıkları kontrol et
